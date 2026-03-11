@@ -105,6 +105,12 @@ func (c *Client) buildRequest(
 		Stream:   opts.Stream,
 	}
 
+	if opts.Stream {
+		req.StreamOptions = &openai.StreamOptions{
+			IncludeUsage: true,
+		}
+	}
+
 	// Add tools if provided
 	if len(opts.Tools) > 0 {
 		req.Tools = c.buildTools(opts.Tools)
@@ -198,7 +204,20 @@ func (c *Client) executeStreamRequest(
 
 			// Check for completion
 			if choice.FinishReason == "stop" {
-				ch <- StreamEvent{Type: EventTypeContentDone, Done: true}
+				// Send usage statistics if available
+				if response.Usage != nil && response.Usage.TotalTokens > 0 {
+					ch <- StreamEvent{
+						Type: EventTypeContentDone,
+						Done: true,
+						Meta: map[string]string{
+							"prompt_tokens":     fmt.Sprintf("%d", response.Usage.PromptTokens),
+							"completion_tokens": fmt.Sprintf("%d", response.Usage.CompletionTokens),
+							"total_tokens":      fmt.Sprintf("%d", response.Usage.TotalTokens),
+						},
+					}
+				} else {
+					ch <- StreamEvent{Type: EventTypeContentDone, Done: true}
+				}
 				return nil
 			}
 		}
