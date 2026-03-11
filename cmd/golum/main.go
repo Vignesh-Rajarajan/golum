@@ -1,51 +1,42 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"log"
 	"os"
 
+	tea "charm.land/bubbletea/v2"
+	"github.com/Vignesh-Rajarajan/golum/internal/ui"
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
-	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
-	"github.com/sashabaranov/go-openai"
 )
 
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Printf("Warning: .env file not found, using environment variables")
 		cfg = &config.Config{
 			OpenAIAPIKey:     os.Getenv("OPENAI_API_KEY"),
 			OpenRouterAPIKey: os.Getenv("OPENROUTER_API_KEY"),
-			BaseURL:          "https://api.openai.com/v1",
-			Model:            "gpt-4o",
+			BaseURL:          os.Getenv("OPENAI_BASE_URL"),
+			Model:            getEnvWithDefault("OPENAI_MODEL", "gpt-4o"),
 		}
 	}
 
-	client := llm.NewClient(cfg)
-
-	ctx := context.Background()
-
-	messages := []openai.ChatCompletionMessage{
-		{
-			Role:    openai.ChatMessageRoleUser,
-			Content: "Hello! Can you help me with something?",
-		},
+	if cfg.OpenAIAPIKey == "" && cfg.OpenRouterAPIKey == "" {
+		fmt.Println("Error: No API key found. Set OPENAI_API_KEY or OPENROUTER_API_KEY environment variable.")
+		os.Exit(1)
 	}
 
-	fmt.Println("Streaming response:")
-	stream := client.Stream(ctx, messages)
+	m := ui.NewModel(cfg)
+	p := tea.NewProgram(m)
 
-	for chunk := range stream {
-		if chunk.Error != nil {
-			log.Printf("Error: %v", chunk.Error)
-			break
-		}
-		if chunk.Done {
-			fmt.Println("\n[Done]")
-			break
-		}
-		fmt.Print(chunk.Content)
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
 	}
+}
+
+func getEnvWithDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
 }
