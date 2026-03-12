@@ -7,6 +7,7 @@ import (
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/Vignesh-Rajarajan/golum/internal/ui/styles"
@@ -21,6 +22,8 @@ type Model struct {
 	messages     []Message
 	input        textinput.Model
 	spinner      spinner.Model
+	viewport     viewport.Model
+	scrollMode   bool
 	streaming    bool
 	ready        bool
 	width        int
@@ -42,12 +45,15 @@ func NewModel(cfg *config.Config) Model {
 
 	sp := spinner.New(spinner.WithSpinner(spinner.Points), spinner.WithStyle(s.Chat.Spinner))
 
+	vp := viewport.New()
+
 	m := Model{
 		styles:   s,
 		client:   llm.NewClient(cfg),
 		messages: make([]Message, 0),
 		input:    ti,
 		spinner:  sp,
+		viewport: vp,
 		ctx:      context.Background(),
 	}
 	return m
@@ -78,14 +84,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.input.Focus())
 		}
 
+		viewportHeight := m.height - 8
+		if viewportHeight < 5 {
+			viewportHeight = 5
+		}
+		m.viewport.SetWidth(m.width)
+		m.viewport.SetHeight(viewportHeight)
+		m.syncViewportContent()
+
 	case tea.KeyPressMsg:
 		key := msg.Key()
+		if m.scrollMode {
+			switch key.String() {
+			case "i", "esc":
+				m.scrollMode = false
+				cmds = append(cmds, m.input.Focus())
+				return m, tea.Batch(cmds...)
+			}
+		} else if key.String() == "esc" {
+			m.scrollMode = true
+			m.input.Blur()
+			return m, nil
+		}
+
 		if key.Mod&tea.ModCtrl != 0 {
 			switch key.Code {
 			case 'c', 'd':
 				return m, tea.Quit
 			}
 		}
+
+		if m.scrollMode {
+			var cmd tea.Cmd
+			m.viewport, cmd = m.viewport.Update(msg)
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
+		}
+
 		if key.Code == tea.KeyEnter {
 			if !m.streaming && m.input.Value() != "" {
 				text := strings.TrimSpace(m.input.Value())
@@ -94,12 +129,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case tea.MouseWheelMsg:
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+
 	case InputSubmitMsg:
 		m.messages = append(m.messages, Message{
 			Role:    RoleUser,
 			Content: msg.Text,
 		})
 		m.streaming = true
+		m.viewport.GotoBottom()
 		return m, m.startStream(msg.Text)
 
 	case StreamMsg:
@@ -112,6 +153,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					Content: msg.Event.Content,
 				})
 			}
+			m.viewport.GotoBottom()
 		} else if msg.Event.Type == llm.EventTypeContentDone {
 			if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
 				m.messages[len(m.messages)-1].Meta = msg.Event.Meta
@@ -121,6 +163,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Role:    RoleError,
 				Content: fmt.Sprintf("Error: %v", msg.Event.Error),
 			})
+			m.viewport.GotoBottom()
 		}
 		if m.streamReader != nil {
 			return m, m.streamReader.Read()
@@ -130,7 +173,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case StreamDoneMsg:
 		m.streaming = false
 		m.streamReader = nil
-		if !m.input.Focused() {
+		m.syncViewportContent()
+		if m.viewport.TotalLineCount() > m.viewport.VisibleLineCount() {
+			m.scrollMode = true
+			m.input.Blur()
+			m.viewport.GotoBottom()
+		} else if !m.input.Focused() {
 			cmds = append(cmds, m.input.Focus())
 		}
 
@@ -157,46 +205,33 @@ func (m Model) View() tea.View {
 	}
 
 	var b strings.Builder
-	linesWritten := 0
 
 	header := styles.ApplyBoldForegroundGrad(&m.styles, "Golum Chat", m.styles.Primary, m.styles.Secondary)
 	header = lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(header)
 	b.WriteString(header)
 	b.WriteString("\n")
-	linesWritten = 1
 
-	contentWidth := m.width - 4
-
-	var renderedMessages []string
-	for _, msg := range m.messages {
-		renderedMessages = append(renderedMessages, msg.Render(contentWidth, m.styles))
+	messagesView := m.renderMessagesView()
+	shouldFollowBottom := m.streaming || m.viewport.AtBottom()
+	m.viewport.SetContent(messagesView)
+	if shouldFollowBottom {
+		m.viewport.GotoBottom()
 	}
-
-	if m.streaming && (len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != RoleAssistant) {
-		spinnerText := m.styles.Chat.Thinking.Render(m.spinner.View() + " Thinking...")
-		renderedMessages = append(renderedMessages, spinnerText)
-	}
-
-	messagesView := strings.Join(renderedMessages, "\n\n")
-	b.WriteString(messagesView)
-	linesWritten += countLines(messagesView)
-	b.WriteString("\n\n")
-	linesWritten += 2
+	b.WriteString(m.viewport.View())
+	b.WriteString("\n")
 
 	var statusText string
 	if m.streaming {
 		statusText = m.styles.Chat.Thinking.Render("Generating response...")
+	} else if m.scrollMode {
+		statusText = m.styles.Chat.Footer.Render("Mouse/↑/↓/j/k to scroll, i or Esc to type, Ctrl+C to quit")
 	} else {
-		statusText = m.styles.Chat.Footer.Render("Press Enter to send, Ctrl+C to quit")
+		statusText = m.styles.Chat.Footer.Render("Press Enter to send, Esc for scroll mode, mouse wheel to scroll, Ctrl+C to quit")
 	}
 	statusBar := m.styles.Chat.StatusBar.Width(m.width).Render(statusText)
 	b.WriteString(statusBar)
 	b.WriteString("\n\n")
-	linesWritten += 3
 
-	// Determine the input's starting row based on the number of newline
-	// characters written so far. This directly corresponds to the row index
-	// on which the input will begin.
 	inputY := countLines(b.String()) - 1
 
 	inputView := m.input.View()
@@ -205,14 +240,11 @@ func (m Model) View() tea.View {
 	v := tea.NewView(b.String())
 	v.BackgroundColor = m.styles.BgBase
 	v.AltScreen = true
+	v.MouseMode = tea.MouseModeAllMotion
 
 	if m.input.Focused() {
 		cursor := m.input.Cursor()
 		if cursor != nil {
-			// textinput's Cursor() returns a cursor positioned relative to the
-			// input view itself (row 0). Offset its row by the number of
-			// lines already written so that the real cursor lines up with
-			// the rendered input.
 			cursor.Y += inputY
 			v.Cursor = cursor
 		}
@@ -225,6 +257,28 @@ func countLines(s string) int {
 		return 0
 	}
 	return strings.Count(s, "\n") + 1
+}
+
+func (m *Model) renderMessagesView() string {
+	contentWidth := m.width - 4
+	var renderedMessages []string
+	for _, msg := range m.messages {
+		renderedMessages = append(renderedMessages, msg.Render(contentWidth, m.styles))
+	}
+
+	if m.streaming && (len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != RoleAssistant) {
+		spinnerText := m.styles.Chat.Thinking.Render(m.spinner.View() + " Thinking...")
+		renderedMessages = append(renderedMessages, spinnerText)
+	}
+
+	return strings.Join(renderedMessages, "\n\n")
+}
+
+func (m *Model) syncViewportContent() {
+	if !m.ready || m.width <= 0 || m.viewport.Height() <= 0 {
+		return
+	}
+	m.viewport.SetContent(m.renderMessagesView())
 }
 
 func (m *Model) sendMessage(text string) tea.Cmd {

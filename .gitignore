@@ -5,6 +5,17 @@
 *.so
 *.dylib
 
+# Binary
+golum
+*.app
+*.dmg
+*.pkg
+*.deb
+*.rpm
+*.tar.gz
+*.zip
+*.7z
+*.rar
 # Test binary
 *.test
 
@@ -31,3 +42,4 @@ Thumbs.db
 # Build
 /bin/
 /dist/
+
