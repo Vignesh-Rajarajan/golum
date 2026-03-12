@@ -159,8 +159,8 @@ func (m Model) View() tea.View {
 	var b strings.Builder
 	linesWritten := 0
 
-	header := m.styles.Chat.Header.Render("Golum Chat")
-	header = lipgloss.NewStyle().Width(m.width).Render(header)
+	header := styles.ApplyBoldForegroundGrad(&m.styles, "Golum Chat", m.styles.Primary, m.styles.Secondary)
+	header = lipgloss.NewStyle().Padding(0, 1).Width(m.width).Render(header)
 	b.WriteString(header)
 	b.WriteString("\n")
 	linesWritten = 1

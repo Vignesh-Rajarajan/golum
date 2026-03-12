@@ -30,7 +30,7 @@ func (m Message) Render(width int, s styles.Styles) string {
 	content = m.Content
 
 	if m.Role == RoleUser {
-		header := s.Chat.Header.Foreground(s.Primary).Render("You")
+		header := styles.ApplyBoldForegroundGrad(&s, "You", s.Primary, s.Secondary)
 		contentStyle := s.Chat.UserMessage.Width(width - 2)
 		rendered = lipgloss.JoinVertical(
 			lipgloss.Left,
@@ -40,7 +40,7 @@ func (m Message) Render(width int, s styles.Styles) string {
 	} else if m.Role == RoleError {
 		rendered = s.Chat.ErrorMessage.Render(content)
 	} else {
-		header := s.Chat.Header.Foreground(s.GreenDark).Render("Assistant")
+		header := styles.ApplyBoldForegroundGrad(&s, "Assistant", s.GreenDark, s.Tertiary)
 
 		md, err := glamour.NewTermRenderer(
 			glamour.WithStyles(s.Markdown),
