@@ -17,20 +17,22 @@ import (
 )
 
 type Model struct {
-	styles       styles.Styles
-	client       *llm.Client
-	messages     []Message
-	input        textinput.Model
-	spinner      spinner.Model
-	viewport     viewport.Model
-	scrollMode   bool
-	streaming    bool
-	ready        bool
-	width        int
-	height       int
-	err          error
-	ctx          context.Context
-	streamReader *streamReader
+	styles        styles.Styles
+	client        *llm.Client
+	messages      []Message
+	input         textinput.Model
+	spinner       spinner.Model
+	viewport      viewport.Model
+	scrollMode    bool
+	streaming     bool
+	ready         bool
+	width         int
+	height        int
+	err           error
+	ctx           context.Context
+	streamReader  *streamReader
+	selectedIndex int
+	copyStatus    string
 }
 
 func NewModel(cfg *config.Config) Model {
@@ -98,8 +100,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key.String() {
 			case "i", "esc":
 				m.scrollMode = false
+				m.selectedIndex = -1
+				m.copyStatus = ""
 				cmds = append(cmds, m.input.Focus())
 				return m, tea.Batch(cmds...)
+			case "j", "down":
+				if len(m.messages) > 0 {
+					m.selectedIndex++
+					if m.selectedIndex >= len(m.messages) {
+						m.selectedIndex = len(m.messages) - 1
+					}
+				}
+			case "k", "up":
+				if len(m.messages) > 0 {
+					m.selectedIndex--
+					if m.selectedIndex < 0 {
+						m.selectedIndex = 0
+					}
+				}
+			case "c", "y":
+				if m.selectedIndex >= 0 && m.selectedIndex < len(m.messages) {
+					m.copyStatus = "Copied!"
+					return m, tea.SetClipboard(m.messages[m.selectedIndex].Content)
+				}
+			case "a":
+				if key.Mod&tea.ModCtrl != 0 && len(m.messages) > 0 {
+					m.selectedIndex = len(m.messages) - 1
+				}
 			}
 		} else if key.String() == "esc" {
 			m.scrollMode = true
@@ -224,7 +251,10 @@ func (m Model) View() tea.View {
 	if m.streaming {
 		statusText = m.styles.Chat.Thinking.Render("Generating response...")
 	} else if m.scrollMode {
-		statusText = m.styles.Chat.Footer.Render("Mouse/↑/↓/j/k to scroll, i or Esc to type, Ctrl+C to quit")
+		statusText = m.styles.Chat.Footer.Render("↑/↓/j/k: navigate | c/y: copy | i/Esc: type | Ctrl+C: quit")
+		if m.copyStatus != "" {
+			statusText = m.styles.Chat.Footer.Render(m.copyStatus + " | ↑/↓/j/k: navigate | c/y: copy | i/Esc: type")
+		}
 	} else {
 		statusText = m.styles.Chat.Footer.Render("Press Enter to send, Esc for scroll mode, mouse wheel to scroll, Ctrl+C to quit")
 	}
@@ -239,7 +269,7 @@ func (m Model) View() tea.View {
 
 	v := tea.NewView(b.String())
 	v.BackgroundColor = m.styles.BgBase
-	v.AltScreen = true
+	v.AltScreen = false
 	v.MouseMode = tea.MouseModeAllMotion
 
 	if m.input.Focused() {
@@ -262,12 +292,20 @@ func countLines(s string) int {
 func (m *Model) renderMessagesView() string {
 	contentWidth := m.width - 4
 	var renderedMessages []string
-	for _, msg := range m.messages {
-		renderedMessages = append(renderedMessages, msg.Render(contentWidth, m.styles))
+	for i, msg := range m.messages {
+		rendered := msg.Render(contentWidth, m.styles)
+		if i == m.selectedIndex && m.scrollMode {
+			selectedStyle := lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder(), false, false, false, true).
+				BorderForeground(m.styles.Primary).
+				PaddingLeft(1)
+			rendered = selectedStyle.Render(rendered)
+		}
+		renderedMessages = append(renderedMessages, rendered)
 	}
 
 	if m.streaming && (len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != RoleAssistant) {
-		spinnerText := m.styles.Chat.Thinking.Render(m.spinner.View() + " Thinking...")
+		spinnerText := m.styles.Chat.Thinking.Render(m.spinner.View() + " Thinking")
 		renderedMessages = append(renderedMessages, spinnerText)
 	}
 
