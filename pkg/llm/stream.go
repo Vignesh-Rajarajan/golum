@@ -38,14 +38,14 @@ func (c *Client) Stream(ctx context.Context, messages []openai.ChatCompletionMes
 				return
 			}
 
-			if len(response.Choices) > 0 {
-				content := response.Choices[0].Delta.Content
-				if content != "" {
-					ch <- StreamChunk{Content: content}
-				}
+			if len(response.Choices) == 0 {
+				continue
 			}
-
-			if response.Choices[0].FinishReason == "stop" {
+			choice := response.Choices[0]
+			if choice.Delta.Content != "" {
+				ch <- StreamChunk{Content: choice.Delta.Content}
+			}
+			if choice.FinishReason != "" {
 				ch <- StreamChunk{Done: true}
 				return
 			}

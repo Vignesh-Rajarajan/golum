@@ -6,10 +6,17 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/Vignesh-Rajarajan/golum/internal/ui"
+	"github.com/Vignesh-Rajarajan/golum/pkg/applog"
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	defer applog.RecoverMain()
+	// Load .env before applog.Init so GOLUM_LOG in .env is visible (Init used to run before godotenv).
+	_ = godotenv.Load()
+	applog.Init()
+
 	cfg, err := config.Load()
 	if err != nil {
 		cfg = &config.Config{

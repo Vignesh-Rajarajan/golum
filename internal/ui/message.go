@@ -6,6 +6,7 @@ import (
 	"charm.land/glamour/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/Vignesh-Rajarajan/golum/internal/ui/styles"
+	"github.com/Vignesh-Rajarajan/golum/pkg/sanitize"
 )
 
 type MessageRole string
@@ -28,6 +29,9 @@ func (m Message) Render(width int, s styles.Styles) string {
 	var rendered string
 
 	content = m.Content
+	if m.Role == RoleAssistant {
+		content = sanitize.StripPseudoToolMarkup(content)
+	}
 
 	if m.Role == RoleUser {
 		header := styles.ApplyBoldForegroundGrad(&s, "You", s.Primary, s.Secondary)

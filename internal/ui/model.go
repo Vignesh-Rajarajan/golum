@@ -3,7 +3,9 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textinput"
@@ -11,15 +13,20 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/Vignesh-Rajarajan/golum/internal/ui/styles"
+	"github.com/Vignesh-Rajarajan/golum/pkg/applog"
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
+	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
 	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
+	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
+	"github.com/Vignesh-Rajarajan/golum/pkg/sanitize"
 	"github.com/mattn/go-runewidth"
-	"github.com/sashabaranov/go-openai"
 )
 
 type Model struct {
 	styles          styles.Styles
 	client          *llm.Client
+	cfg             *config.Config
+	ctxMgr          *contextmgr.ContextManager
 	messages        []Message
 	input           textinput.Model
 	spinner         spinner.Model
@@ -76,9 +83,17 @@ func NewModel(cfg *config.Config) Model {
 
 	vp := viewport.New()
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = ""
+	}
+	ctxMgr := contextmgr.NewContextManager(cfg, prompt.PromptConfig{CWD: cwd}, nil, nil)
+
 	m := Model{
 		styles:   s,
 		client:   llm.NewClient(cfg),
+		cfg:      cfg,
+		ctxMgr:   ctxMgr,
 		messages: make([]Message, 0),
 		input:    ti,
 		spinner:  sp,
@@ -222,10 +237,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Role:    RoleUser,
 			Content: msg.Text,
 		})
+		m.ctxMgr.AddUserMessage(msg.Text)
 		m.streaming = true
 		m.syncViewportContent()
 		m.viewport.GotoBottom()
-		return m, m.startStream(msg.Text)
+		return m, m.startStream()
 
 	case StreamMsg:
 		if msg.Event.Type == llm.EventTypeContentDelta {
@@ -241,8 +257,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if msg.Event.Type == llm.EventTypeContentDone {
 			if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
 				m.messages[len(m.messages)-1].Meta = msg.Event.Meta
+				cleaned := sanitize.StripPseudoToolMarkup(m.messages[len(m.messages)-1].Content)
+				m.messages[len(m.messages)-1].Content = cleaned
+				m.ctxMgr.AddAssistantMessage(cleaned, nil)
+			}
+			u := contextmgr.TokenUsageFromMeta(msg.Event.Meta)
+			if u.TotalTokens > 0 || u.PromptTokens > 0 || u.CompletionTokens > 0 {
+				m.ctxMgr.SetLatestUsage(u)
+				m.ctxMgr.AddUsage(u)
 			}
 		} else if msg.Event.Type == llm.EventTypeError {
+			applog.Printf("stream error: %v", msg.Event.Error)
+			m.streaming = false
 			m.messages = append(m.messages, Message{
 				Role:    RoleError,
 				Content: fmt.Sprintf("Error: %v", msg.Event.Error),
@@ -256,7 +282,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case StreamDoneMsg:
-		m.streaming = false
+		if m.streaming {
+			m.streaming = false
+		}
 		m.streamReader = nil
 		m.syncViewportContent()
 		if m.viewport.TotalLineCount() > m.viewport.VisibleLineCount() {
@@ -308,12 +336,16 @@ func (m Model) View() tea.View {
 	if m.streaming {
 		statusText = m.styles.Chat.Thinking.Render("Generating response...")
 	} else if m.scrollMode {
-		statusText = m.styles.Chat.Footer.Render("←/→/↑/↓ or h/j/k/l: move | v: select | y: copy | Ctrl+A: all | i/Esc: type")
+		statusText = m.styles.Chat.Footer.Render("Scroll long reply · ←/→/↑/↓ or h/j/k/l: move | v: select | y: copy | Ctrl+A: all | i/Esc: type")
 		if m.copyStatus != "" {
 			statusText = m.styles.Chat.Footer.Render(m.copyStatus + " | v: select | y: copy | Ctrl+A: all | i/Esc: type")
 		}
 	} else {
-		statusText = m.styles.Chat.Footer.Render("Press Enter to send, Esc for scroll mode, mouse wheel to scroll, Ctrl+C to quit")
+		line := "Press Enter to send, Esc for scroll mode, mouse wheel to scroll, Ctrl+C to quit"
+		if hint := m.sessionFooterHint(); hint != "" {
+			line = hint + " · " + line
+		}
+		statusText = m.styles.Chat.Footer.Render(line)
 	}
 	statusBar := m.styles.Chat.StatusBar.Width(m.width).Render(statusText)
 	b.WriteString(statusBar)
@@ -361,8 +393,8 @@ func (m *Model) renderStyledMessagesView() string {
 		renderedMessages = append(renderedMessages, msg.Render(contentWidth, m.styles))
 	}
 
-	if m.streaming && (len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != RoleAssistant) {
-		spinnerText := m.styles.Chat.Thinking.Render(m.spinner.View() + " Thinking...")
+	if m.showStreamingSpinner() {
+		spinnerText := m.styles.Chat.Thinking.Render(m.spinner.View() + " Waiting for response…")
 		renderedMessages = append(renderedMessages, spinnerText)
 	}
 
@@ -600,7 +632,7 @@ func (m *Model) syncSelectableBuffer() {
 		}
 	}
 
-	if m.streaming && (len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != RoleAssistant) {
+	if m.showStreamingSpinner() {
 		if len(seeds) > 0 {
 			seeds = append(seeds, lineSeed{Kind: selectableLineBlank})
 		}
@@ -610,7 +642,7 @@ func (m *Model) syncSelectableBuffer() {
 			Kind: selectableLineHeader,
 		})
 		seeds = append(seeds, lineSeed{
-			Text: "Thinking...",
+			Text: "Waiting for response…",
 			Role: RoleAssistant,
 			Kind: selectableLineMeta,
 		})
@@ -783,22 +815,39 @@ func clampInt(v, minV, maxV int) int {
 	return v
 }
 
+func (m Model) showStreamingSpinner() bool {
+	if !m.streaming {
+		return false
+	}
+	if len(m.messages) == 0 {
+		return true
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != RoleAssistant {
+		return true
+	}
+	return strings.TrimSpace(last.Content) == ""
+}
+
 func (m *Model) sendMessage(text string) tea.Cmd {
 	return func() tea.Msg {
 		return InputSubmitMsg{Text: text}
 	}
 }
 
-func (m *Model) startStream(text string) tea.Cmd {
-	history := m.buildHistory()
-	history = append(history, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: text,
-	})
+func (m *Model) startStream() tea.Cmd {
+	history := m.ctxMgr.ChatCompletionMessages()
+
+	timeout := 10 * time.Minute
+	if m.cfg != nil {
+		timeout = m.cfg.StreamTimeoutOrDefault()
+	}
+	applog.Printf("ui: startStream history_msgs=%d timeout=%s", len(history), timeout)
 
 	opts := llm.ChatCompletionOptions{
 		Stream:     true,
 		MaxRetries: 3,
+		Timeout:    timeout,
 	}
 
 	events := m.client.ChatCompletion(m.ctx, history, opts)
@@ -806,24 +855,20 @@ func (m *Model) startStream(text string) tea.Cmd {
 	return m.streamReader.Read()
 }
 
-func (m *Model) buildHistory() []openai.ChatCompletionMessage {
-	var history []openai.ChatCompletionMessage
-	for _, msg := range m.messages {
-		var role string
-		switch msg.Role {
-		case RoleUser:
-			role = openai.ChatMessageRoleUser
-		case RoleAssistant:
-			role = openai.ChatMessageRoleAssistant
-		case RoleSystem:
-			role = openai.ChatMessageRoleSystem
-		default:
-			continue
-		}
-		history = append(history, openai.ChatCompletionMessage{
-			Role:    role,
-			Content: msg.Content,
-		})
+func (m Model) sessionFooterHint() string {
+	if m.ctxMgr == nil {
+		return ""
 	}
-	return history
+	tu := m.ctxMgr.TotalUsage
+	var b strings.Builder
+	if tu.TotalTokens > 0 {
+		fmt.Fprintf(&b, "session Σ %d tok", tu.TotalTokens)
+	}
+	if m.ctxMgr.NeedsCompression() {
+		if b.Len() > 0 {
+			b.WriteString(" · ")
+		}
+		b.WriteString("last response >80% context — summarize or start fresh")
+	}
+	return b.String()
 }

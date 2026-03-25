@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
+	"github.com/Vignesh-Rajarajan/golum/pkg/applog"
 	"github.com/sashabaranov/go-openai"
 )
+
+const defaultStreamTimeout = 10 * time.Minute
 
 // DefaultMaxRetries is the default number of retries for rate limit and connection errors
 const DefaultMaxRetries = 3
@@ -62,6 +66,16 @@ func (c *Client) ChatCompletion(
 
 	go func() {
 		defer close(ch)
+		defer func() {
+			if r := recover(); r != nil {
+				applog.Init()
+				applog.LogPanic("llm.ChatCompletion", r)
+				select {
+				case ch <- StreamEvent{Type: EventTypeError, Error: fmt.Errorf("internal error: %v", r)}:
+				default:
+				}
+			}
+		}()
 
 		// Set defaults
 		if opts.MaxRetries == 0 {
@@ -71,9 +85,16 @@ func (c *Client) ChatCompletion(
 		// Build the request
 		req := c.buildRequest(messages, opts)
 
+		timeout := opts.Timeout
+		if timeout <= 0 {
+			timeout = defaultStreamTimeout
+		}
+
 		// Retry loop
 		for attempt := 0; attempt <= opts.MaxRetries; attempt++ {
-			err := c.executeRequest(ctx, req, opts.Stream, ch)
+			reqCtx, cancel := context.WithTimeout(ctx, timeout)
+			err := c.executeRequest(reqCtx, req, opts.Stream, ch)
+			cancel()
 
 			if err == nil {
 				// Success, we're done
@@ -149,77 +170,94 @@ func (c *Client) executeRequest(
 	return c.executeNonStreamRequest(ctx, req, ch)
 }
 
+func streamUsageMeta(u *openai.Usage) map[string]string {
+	if u == nil || u.TotalTokens <= 0 {
+		return nil
+	}
+	return map[string]string{
+		"prompt_tokens":     fmt.Sprintf("%d", u.PromptTokens),
+		"completion_tokens": fmt.Sprintf("%d", u.CompletionTokens),
+		"total_tokens":      fmt.Sprintf("%d", u.TotalTokens),
+	}
+}
+
+func streamDoneEvent(usage *openai.Usage) StreamEvent {
+	ev := StreamEvent{Type: EventTypeContentDone, Done: true}
+	if m := streamUsageMeta(usage); m != nil {
+		ev.Meta = m
+	}
+	return ev
+}
+
 // executeStreamRequest handles streaming chat completion
 func (c *Client) executeStreamRequest(
 	ctx context.Context,
 	req openai.ChatCompletionRequest,
 	ch chan<- StreamEvent,
 ) error {
-	// Send content start event
 	ch <- StreamEvent{Type: EventTypeContentStart}
 
-	// Create stream
+	applog.Printf("stream: CreateChatCompletionStream model=%q msgs=%d", c.config.Model, len(req.Messages))
 	stream, err := c.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
+		applog.Printf("stream: CreateChatCompletionStream error: %v", err)
 		return err
 	}
 	defer stream.Close()
 
-	// Process stream
+	first := true
 	for {
-		response, err := stream.Recv()
+		raw, err := stream.RecvRaw()
 		if err != nil {
-			// Check if it's EOF (stream finished)
-			if errors.Is(err, context.Canceled) || err.Error() == "EOF" {
+			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || err.Error() == "EOF" {
+				applog.Printf("stream: recv EOF (done=%v)", err)
 				ch <- StreamEvent{Type: EventTypeContentDone, Done: true}
 				return nil
 			}
+			applog.Printf("stream: recv error: %v", err)
 			return err
 		}
+		if first {
+			applog.Printf("stream: first chunk raw_bytes=%d", len(raw))
+			first = false
+		}
 
-		// Process choices
-		if len(response.Choices) > 0 {
-			choice := response.Choices[0]
+		content, finishReason, usage, toolCalls, hasChoices, err := parseStreamingChunk(raw)
+		if err != nil {
+			applog.Printf("stream: chunk json: %v", err)
+			continue
+		}
 
-			// Send content delta
-			if choice.Delta.Content != "" {
-				ch <- StreamEvent{
-					Type:    EventTypeContentDelta,
-					Content: choice.Delta.Content,
-				}
-			}
-
-			// Handle tool calls
-			if len(choice.Delta.ToolCalls) > 0 {
-				for _, toolCall := range choice.Delta.ToolCalls {
-					ch <- StreamEvent{
-						Type: EventTypeToolCall,
-						Tool: &ToolCall{
-							ID:   toolCall.ID,
-							Name: toolCall.Function.Name,
-						},
-					}
-				}
-			}
-
-			// Check for completion
-			if choice.FinishReason == "stop" {
-				// Send usage statistics if available
-				if response.Usage != nil && response.Usage.TotalTokens > 0 {
-					ch <- StreamEvent{
-						Type: EventTypeContentDone,
-						Done: true,
-						Meta: map[string]string{
-							"prompt_tokens":     fmt.Sprintf("%d", response.Usage.PromptTokens),
-							"completion_tokens": fmt.Sprintf("%d", response.Usage.CompletionTokens),
-							"total_tokens":      fmt.Sprintf("%d", response.Usage.TotalTokens),
-						},
-					}
-				} else {
-					ch <- StreamEvent{Type: EventTypeContentDone, Done: true}
-				}
+		// Usage-only final chunk (OpenAI: choices may be empty when using stream_options include_usage).
+		if !hasChoices {
+			if usage != nil && usage.TotalTokens > 0 {
+				ch <- streamDoneEvent(usage)
 				return nil
 			}
+			continue
+		}
+
+		if content != "" {
+			ch <- StreamEvent{
+				Type:    EventTypeContentDelta,
+				Content: content,
+			}
+		}
+
+		for _, toolCall := range toolCalls {
+			ch <- StreamEvent{
+				Type: EventTypeToolCall,
+				Tool: &ToolCall{
+					ID:   toolCall.ID,
+					Name: toolCall.Function.Name,
+				},
+			}
+		}
+
+		if finishReason != "" {
+			applog.Printf("stream: finish_reason=%q has_usage=%v", finishReason, usage != nil)
+			ch <- streamDoneEvent(usage)
+			return nil
 		}
 	}
 }
@@ -290,7 +328,13 @@ func (c *Client) shouldRetry(
 	maxRetries int,
 	ch chan<- StreamEvent,
 ) bool {
-	// Check error type
+	if errors.Is(err, context.DeadlineExceeded) {
+		ch <- StreamEvent{
+			Type:  EventTypeError,
+			Error: fmt.Errorf("request timed out (stream stalled or server too slow); increase GOLUM_STREAM_TIMEOUT: %w", err),
+		}
+		return false
+	}
 
 	// Rate limit error
 	if isRateLimitError(err) {
