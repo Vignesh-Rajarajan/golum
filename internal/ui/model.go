@@ -23,28 +23,31 @@ import (
 )
 
 type Model struct {
-	styles          styles.Styles
-	client          *llm.Client
-	cfg             *config.Config
-	ctxMgr          *contextmgr.ContextManager
-	messages        []Message
-	input           textinput.Model
-	spinner         spinner.Model
-	viewport        viewport.Model
-	scrollMode      bool
-	streaming       bool
-	ready           bool
-	width           int
-	height          int
-	err             error
-	ctx             context.Context
-	streamReader    *streamReader
-	selectionMode   bool
-	selectionAnchor selectionPos
-	selectionCursor selectionPos
-	selectableText  string
-	selectableLines []selectableLine
-	copyStatus      string
+	styles                styles.Styles
+	client                *llm.Client
+	cfg                   *config.Config
+	ctxMgr                *contextmgr.ContextManager
+	messages              []Message
+	input                 textinput.Model
+	spinner               spinner.Model
+	viewport              viewport.Model
+	scrollMode            bool
+	streaming             bool
+	ready                 bool
+	width                 int
+	height                int
+	err                   error
+	ctx                   context.Context
+	streamReader          *streamReader
+	streamCancel          context.CancelFunc
+	streamCancelled       bool // user aborted; ignore late deltas until stream ends
+	skipScrollAfterStream bool // avoid copy-mode after a cancelled stream
+	selectionMode         bool
+	selectionAnchor       selectionPos
+	selectionCursor       selectionPos
+	selectableText        string
+	selectableLines       []selectableLine
+	copyStatus            string
 }
 
 type selectionPos struct {
@@ -201,6 +204,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.syncViewportContent()
 			return m, nil
 		} else if key.String() == "esc" {
+			if m.streaming {
+				m.abortStream()
+				m.syncViewportContent()
+				return m, nil
+			}
 			m.enterScrollMode()
 			return m, nil
 		}
@@ -209,6 +217,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key.Code {
 			case 'c', 'd':
 				return m, tea.Quit
+			case 'l':
+				if !m.streaming && !m.scrollMode {
+					m.messages = nil
+					m.ctxMgr.Clear()
+					m.copyStatus = ""
+					m.syncViewportContent()
+					return m, m.input.Focus()
+				}
 			}
 		}
 
@@ -245,6 +261,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case StreamMsg:
 		if msg.Event.Type == llm.EventTypeContentDelta {
+			if m.streamCancelled {
+				m.syncViewportContent()
+				if m.streamReader != nil {
+					return m, m.streamReader.Read()
+				}
+				return m, nil
+			}
 			if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
 				m.messages[len(m.messages)-1].Content += msg.Event.Content
 			} else {
@@ -255,6 +278,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.viewport.GotoBottom()
 		} else if msg.Event.Type == llm.EventTypeContentDone {
+			if msg.Event.Cancelled {
+				m.streaming = false
+				m.streamCancelled = false
+				m.skipScrollAfterStream = true
+				if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
+					m.messages = m.messages[:len(m.messages)-1]
+				}
+				m.syncViewportContent()
+				if m.streamReader != nil {
+					return m, m.streamReader.Read()
+				}
+				return m, nil
+			}
 			if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
 				m.messages[len(m.messages)-1].Meta = msg.Event.Meta
 				cleaned := sanitize.StripPseudoToolMarkup(m.messages[len(m.messages)-1].Content)
@@ -286,13 +322,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streaming = false
 		}
 		m.streamReader = nil
+		m.streamCancelled = false
+		m.releaseStreamCancel()
 		m.syncViewportContent()
-		if m.viewport.TotalLineCount() > m.viewport.VisibleLineCount() {
+		longReply := m.viewport.TotalLineCount() > m.viewport.VisibleLineCount()
+		if longReply && !m.skipScrollAfterStream {
 			m.enterScrollMode()
 			m.viewport.GotoBottom()
 		} else if !m.input.Focused() {
 			cmds = append(cmds, m.input.Focus())
 		}
+		m.skipScrollAfterStream = false
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -334,14 +374,14 @@ func (m Model) View() tea.View {
 
 	var statusText string
 	if m.streaming {
-		statusText = m.styles.Chat.Thinking.Render("Generating response...")
+		statusText = m.styles.Chat.Thinking.Render("Generating response… · Esc cancels")
 	} else if m.scrollMode {
 		statusText = m.styles.Chat.Footer.Render("Scroll long reply · ←/→/↑/↓ or h/j/k/l: move | v: select | y: copy | Ctrl+A: all | i/Esc: type")
 		if m.copyStatus != "" {
 			statusText = m.styles.Chat.Footer.Render(m.copyStatus + " | v: select | y: copy | Ctrl+A: all | i/Esc: type")
 		}
 	} else {
-		line := "Press Enter to send, Esc for scroll mode, mouse wheel to scroll, Ctrl+C to quit"
+		line := "Enter to send · Esc: scroll/copy · Ctrl+L: clear chat · mouse wheel · Ctrl+C quit"
 		if hint := m.sessionFooterHint(); hint != "" {
 			line = hint + " · " + line
 		}
@@ -835,7 +875,36 @@ func (m *Model) sendMessage(text string) tea.Cmd {
 	}
 }
 
+func (m *Model) releaseStreamCancel() {
+	if m.streamCancel != nil {
+		m.streamCancel()
+		m.streamCancel = nil
+	}
+}
+
+// abortStream cancels the in-flight API request, drops any partial assistant bubble, and
+// suppresses auto-entering scroll/copy mode when the stream ends.
+func (m *Model) abortStream() {
+	m.skipScrollAfterStream = true
+	if m.streamCancel != nil {
+		m.streamCancel()
+	}
+	m.streamCancelled = true
+	m.streaming = false
+	if len(m.messages) == 0 {
+		return
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role == RoleAssistant {
+		m.messages = m.messages[:len(m.messages)-1]
+	}
+}
+
 func (m *Model) startStream() tea.Cmd {
+	m.releaseStreamCancel()
+	m.streamCancelled = false
+	m.skipScrollAfterStream = false
+
 	history := m.ctxMgr.ChatCompletionMessages()
 
 	timeout := 10 * time.Minute
@@ -850,7 +919,10 @@ func (m *Model) startStream() tea.Cmd {
 		Timeout:    timeout,
 	}
 
-	events := m.client.ChatCompletion(m.ctx, history, opts)
+	streamCtx, cancel := context.WithCancel(m.ctx)
+	m.streamCancel = cancel
+
+	events := m.client.ChatCompletion(streamCtx, history, opts)
 	m.streamReader = &streamReader{events: events}
 	return m.streamReader.Read()
 }

@@ -3,11 +3,15 @@
 //
 // Important: call Init() after godotenv (or config.Load) so GOLUM_LOG from a .env file is visible.
 //
-// When GOLUM_LOG is set, logs go only to the file—not stderr—so Bubble Tea’s raw terminal UI is not corrupted.
-// With no GOLUM_LOG, logs go to stderr only (useful when running without a file).
+// When GOLUM_LOG is set, logs go only to the file—not the terminal—so Bubble Tea’s UI is not corrupted.
+// With no GOLUM_LOG, runtime logs are discarded: writing stderr while the TUI holds the terminal
+// interleaves with the alt-screen redraw and can make log lines appear on the input/prompt line.
+// Use GOLUM_LOG when you need a trace (e.g. /tmp/golum.log).
 package applog
 
 import (
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -36,21 +40,21 @@ func Init() {
 	prefix := "golum "
 	path := os.Getenv("GOLUM_LOG")
 	if path == "" {
-		std = log.New(os.Stderr, prefix, flags)
+		std = log.New(io.Discard, prefix, flags)
 		return
 	}
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0750); err != nil {
-			std = log.New(os.Stderr, prefix, flags)
-			std.Printf("applog: mkdir %s: %v", dir, err)
+			fmt.Fprintf(os.Stderr, "golum applog: mkdir %s: %v\n", dir, err)
+			std = log.New(io.Discard, prefix, flags)
 			return
 		}
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
-		std = log.New(os.Stderr, prefix, flags)
-		std.Printf("applog: open %s: %v", path, err)
+		fmt.Fprintf(os.Stderr, "golum applog: open %s: %v\n", path, err)
+		std = log.New(io.Discard, prefix, flags)
 		return
 	}
 	fileW := syncFileWriter{f: f}
@@ -59,7 +63,7 @@ func Init() {
 	std.Printf("logging to %s (GOLUM_LOG=%q)\n", path, path)
 }
 
-// Logger returns the configured logger, initializing to stderr if needed.
+// Logger returns the configured logger (discard, file, or as set by Init).
 func Logger() *log.Logger {
 	if std == nil {
 		Init()
@@ -67,14 +71,14 @@ func Logger() *log.Logger {
 	return std
 }
 
-// Printf writes a log line (file only when GOLUM_LOG is set; else stderr).
+// Printf writes a log line (to GOLUM_LOG file when set; otherwise discarded).
 func Printf(format string, v ...any) {
 	Logger().Printf(format, v...)
 }
 
-// LogPanic writes stack trace to the log (and stderr). Does not re-panic.
+// LogPanic writes stack trace to stderr (never the discard logger). Does not re-panic.
 func LogPanic(scope string, r any) {
-	Logger().Printf("panic in %s: %v\n%s", scope, r, string(debug.Stack()))
+	fmt.Fprintf(os.Stderr, "golum panic in %s: %v\n%s", scope, r, string(debug.Stack()))
 }
 
 // RecoverMain is meant for `defer RecoverMain()` at the top of main.

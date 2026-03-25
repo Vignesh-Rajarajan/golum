@@ -200,6 +200,11 @@ func (c *Client) executeStreamRequest(
 	applog.Printf("stream: CreateChatCompletionStream model=%q msgs=%d", c.config.Model, len(req.Messages))
 	stream, err := c.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			applog.Printf("stream: CreateChatCompletionStream cancelled")
+			ch <- StreamEvent{Type: EventTypeContentDone, Done: true, Cancelled: true}
+			return nil
+		}
 		applog.Printf("stream: CreateChatCompletionStream error: %v", err)
 		return err
 	}
@@ -209,7 +214,12 @@ func (c *Client) executeStreamRequest(
 	for {
 		raw, err := stream.RecvRaw()
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || err.Error() == "EOF" {
+			if errors.Is(err, context.Canceled) {
+				applog.Printf("stream: recv cancelled")
+				ch <- StreamEvent{Type: EventTypeContentDone, Done: true, Cancelled: true}
+				return nil
+			}
+			if errors.Is(err, io.EOF) || err.Error() == "EOF" {
 				applog.Printf("stream: recv EOF (done=%v)", err)
 				ch <- StreamEvent{Type: EventTypeContentDone, Done: true}
 				return nil
@@ -328,6 +338,10 @@ func (c *Client) shouldRetry(
 	maxRetries int,
 	ch chan<- StreamEvent,
 ) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+
 	if errors.Is(err, context.DeadlineExceeded) {
 		ch <- StreamEvent{
 			Type:  EventTypeError,
