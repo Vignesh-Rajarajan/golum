@@ -17,12 +17,13 @@ const (
 
 // StreamEvent represents a single event in the stream
 type StreamEvent struct {
-	Type    EventType
-	Content string            // For content delta events
-	Error   error             // For error events
-	Tool    *ToolCall         // For tool call events
-	Done    bool              // For completion events
-	Meta    map[string]string // Additional metadata
+	Type      EventType
+	Content   string            // For content delta events
+	Error     error             // For error events
+	Tool      *ToolCall         // For tool call events
+	Done      bool              // For completion events
+	Cancelled bool              // True when the request context was cancelled (user abort)
+	Meta      map[string]string // Additional metadata
 }
 
 // ToolCall represents a tool/function call from the LLM
