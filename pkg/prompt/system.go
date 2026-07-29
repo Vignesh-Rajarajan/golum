@@ -16,14 +16,15 @@ import (
 func GetSystemPrompt(cfg PromptConfig, userMemory *string, tools []llm.Tool) string {
 	var parts []string
 
-	parts = append(parts, getIdentitySection())
-	parts = append(parts, getEnvironmentSection(cfg))
+	toolsEnabled := len(tools) > 0
+	parts = append(parts, getIdentitySection(toolsEnabled))
+	parts = append(parts, getEnvironmentSection(cfg, toolsEnabled))
 
 	if len(tools) > 0 {
 		parts = append(parts, getToolGuidelinesSection(tools))
 	}
 
-	parts = append(parts, getAgentsMDSection())
+	parts = append(parts, getAgentsMDSection(toolsEnabled))
 	parts = append(parts, getSecuritySection())
 
 	if strings.TrimSpace(cfg.DeveloperInstructions) != "" {
@@ -36,7 +37,7 @@ func GetSystemPrompt(cfg PromptConfig, userMemory *string, tools []llm.Tool) str
 		parts = append(parts, getMemorySection(*userMemory))
 	}
 
-	parts = append(parts, getOperationalSection())
+	parts = append(parts, getOperationalSection(toolsEnabled))
 	parts = append(parts, getGolumChatClientSection())
 
 	return strings.Join(parts, "\n\n")
@@ -47,10 +48,21 @@ func getGolumChatClientSection() string {
 
 You are running inside **Golum**, a minimal terminal chat UI. It does **not** execute tools, shells, or agent function calls—there is no tool runtime and no parser for XML or JSON tool payloads.
 
-**Do not** output pseudo tool syntax (for example XML-style tool_call blocks, split tool tags, function= lines, parameter blocks, or structured todos meant for an agent harness). Do not pretend to invoke tools. Reply in natural language and markdown only (use fenced code blocks for real program text).`
+**Do not** output pseudo tool syntax (for example XML-style tool_call blocks, split tool tags, function= lines, parameter blocks, or structured todos meant for an agent harness). Do not pretend to invoke tools. Reply in natural language and markdown only (use fenced code blocks for real program text).
+
+**Direct answers:** For questions that ask for code, interfaces, or definitions, answer with the code or signature immediately. Do not narrate a plan ("I need to…", "Let me check…", numbered steps) or offer to read AGENTS.md or the repository—you cannot.`
 }
 
-func getIdentitySection() string {
+func getIdentitySection(toolsEnabled bool) string {
+	if !toolsEnabled {
+		return `# Identity
+
+You are an AI coding assistant. Be precise, safe, and helpful.
+
+This client has **no tool or shell execution**—you cannot read files, run commands, or call functions. Answer from the conversation and general knowledge only, in natural language and markdown (use fenced code blocks for code).
+
+You are pair programming with the user to help them accomplish their goals.`
+	}
 	return `# Identity
 
 You are an AI coding agent, a terminal-based coding assistant. You are expected to be precise, safe and helpful.
@@ -64,13 +76,18 @@ Your capabilities:
 You are pair programming with the user to help them accomplish their goals. You should be proactive, thorough and focused on delivering high-quality results.`
 }
 
-func getEnvironmentSection(cfg PromptConfig) string {
+func getEnvironmentSection(cfg PromptConfig, toolsEnabled bool) string {
 	now := time.Now()
 	osInfo := fmt.Sprintf("%s (%s)", runtime.GOOS, runtime.Version())
 
 	cwd := cfg.CWD
 	if cwd == "" {
 		cwd = "(unknown)"
+	}
+
+	tail := "This chat client does not execute tools or shell commands; describe steps or show code only."
+	if toolsEnabled {
+		tail = "The user has granted you access to run tools in service of their request. Use them when needed."
 	}
 
 	return fmt.Sprintf(`# Environment
@@ -80,15 +97,21 @@ func getEnvironmentSection(cfg PromptConfig) string {
 - **Working Directory**: %s
 - **Shell**: %s
 
-The user has granted you access to run tools in service of their request. Use them when needed.`,
+%s`,
 		now.Format("Monday, January 02, 2006"),
 		osInfo,
 		cwd,
 		getShellInfo(),
+		tail,
 	)
 }
 
-func getAgentsMDSection() string {
+func getAgentsMDSection(toolsEnabled bool) string {
+	if !toolsEnabled {
+		return `# Project conventions
+
+If the system message already included AGENTS.md or project instructions, follow them. You cannot read files from disk in this client—do not say you will open or re-read AGENTS.md.`
+	}
 	return `# AGENTS.md Specification
 
 - Repos often contain AGENTS.md files. These files can appear anywhere within the repository.
@@ -119,7 +142,18 @@ func getSecuritySection() string {
 6. **Security First**: Always apply security best practices. Never introduce code that exposes, logs, or commits secrets, API keys, or other sensitive information.`
 }
 
-func getOperationalSection() string {
+func getOperationalSection(toolsEnabled bool) string {
+	if !toolsEnabled {
+		return `# Operational Guidelines
+
+## Tone and style
+- **Concise and direct.** No filler, preambles ("I'll help you…"), or postambles.
+- **Answer first:** For technical questions (interfaces, code, APIs), give the answer immediately in markdown—do not output plans, numbered "I will" steps, or offers to explore the repo or read files.
+
+## Code
+- Use fenced code blocks for Go or other languages.
+- For "generate an interface" or similar, output the ` + "`interface { ... }`" + ` and method signatures without extra narration unless the user asks for explanation.`
+	}
 	return `# Operational Guidelines
 
 ## Tone and Style (CLI Interaction)

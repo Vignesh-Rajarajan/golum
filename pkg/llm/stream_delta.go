@@ -2,15 +2,23 @@ package llm
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 
 	"github.com/sashabaranov/go-openai"
 )
 
+// streamReasoning reports whether reasoning/thinking deltas should be appended to the
+// assistant message. Default is false: only delta.content is shown, so internal
+// reasoning streams do not replace or precede the actual answer. Set GOLUM_STREAM_REASONING=1
+// to include reasoning_content / reasoning / thinking when content is empty (legacy behavior).
+func streamReasoning() bool {
+	return os.Getenv("GOLUM_STREAM_REASONING") == "1"
+}
+
 // parseStreamingChunk unmarshals one SSE JSON line and extracts assistant text.
-// Some providers (e.g. GLM via OpenRouter) put visible text in reasoning_content or
-// other fields not mapped to Delta.Content in go-openai, which would otherwise yield
-// an empty reply in the TUI.
+// When Delta.Content is empty, deltaTextFromRawJSON may fill from the raw JSON (e.g. providers
+// that omit fields go-openai maps). Reasoning fields are only used if GOLUM_STREAM_REASONING=1.
 func parseStreamingChunk(raw []byte) (
 	content string,
 	finishReason string,
@@ -32,7 +40,9 @@ func parseStreamingChunk(raw []byte) (
 	finishReason = string(ch.FinishReason)
 	toolCalls = ch.Delta.ToolCalls
 
-	content = strings.TrimSpace(ch.Delta.Content)
+	// Do not TrimSpace per chunk: streams often split on word boundaries, so a chunk may be
+	// only a space or end with a trailing space; trimming destroys inter-word spacing (e.g. "Hello"+" "+"world" → "Helloworld").
+	content = ch.Delta.Content
 	if content == "" {
 		content = deltaTextFromRawJSON(raw)
 	}
@@ -63,9 +73,11 @@ func extractTextFromDeltaMap(m map[string]interface{}) string {
 	if s, ok := m["content"].(string); ok && strings.TrimSpace(s) != "" {
 		return s
 	}
-	for _, k := range []string{"reasoning_content", "reasoning", "thinking"} {
-		if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
-			return s
+	if streamReasoning() {
+		for _, k := range []string{"reasoning_content", "reasoning", "thinking"} {
+			if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
+				return s
+			}
 		}
 	}
 	if arr, ok := m["content"].([]interface{}); ok {

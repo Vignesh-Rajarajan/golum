@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Vignesh-Rajarajan/golum/pkg/config"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -709,6 +710,96 @@ func TestChatCompletion_ExponentialBackoff(t *testing.T) {
 
 	if elapsed > 5*time.Second {
 		t.Errorf("backoff took too long: %v", elapsed)
+	}
+}
+
+// TestBuildTools verifies llm.Tool is converted to openai.Tool without a parallel type.
+func TestBuildTools(t *testing.T) {
+	c := NewClient(&config.Config{OpenAIAPIKey: "test-key", Model: "gpt-4o"})
+
+	tools := []Tool{
+		{
+			Type: "function",
+			Function: ToolFunction{
+				Name:        "read_file",
+				Description: "Read a file from disk",
+				Parameters:  map[string]interface{}{"type": "object"},
+			},
+		},
+	}
+
+	got := c.buildTools(tools)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(got))
+	}
+	if got[0].Type != openai.ToolType("function") {
+		t.Errorf("expected type function, got %v", got[0].Type)
+	}
+	if got[0].Function == nil || got[0].Function.Name != "read_file" || got[0].Function.Description != "Read a file from disk" {
+		t.Errorf("unexpected function mapping: %+v", got[0].Function)
+	}
+}
+
+func TestBuildTools_empty(t *testing.T) {
+	c := NewClient(&config.Config{OpenAIAPIKey: "test-key", Model: "gpt-4o"})
+	got := c.buildTools(nil)
+	if len(got) != 0 {
+		t.Fatalf("expected empty slice, got %d", len(got))
+	}
+}
+
+func TestBuildRequest_WithToolsSetsToolChoiceAuto(t *testing.T) {
+	c := NewClient(&config.Config{OpenAIAPIKey: "test-key", Model: "gpt-4o"})
+	tools := []Tool{{Type: "function", Function: ToolFunction{Name: "shell"}}}
+
+	req := c.buildRequest(nil, ChatCompletionOptions{Tools: tools})
+	if len(req.Tools) != 1 {
+		t.Fatalf("expected 1 tool on request, got %d", len(req.Tools))
+	}
+	if req.ToolChoice != "auto" {
+		t.Errorf("expected ToolChoice auto, got %v", req.ToolChoice)
+	}
+}
+
+func TestBuildRequest_WithoutToolsLeavesToolChoiceUnset(t *testing.T) {
+	c := NewClient(&config.Config{OpenAIAPIKey: "test-key", Model: "gpt-4o"})
+
+	req := c.buildRequest(nil, ChatCompletionOptions{})
+	if len(req.Tools) != 0 {
+		t.Fatalf("expected no tools, got %d", len(req.Tools))
+	}
+	if req.ToolChoice != nil {
+		t.Errorf("expected nil ToolChoice, got %v", req.ToolChoice)
+	}
+}
+
+func TestStreamUsageMeta_nilAndZero(t *testing.T) {
+	if m := streamUsageMeta(nil); m != nil {
+		t.Errorf("expected nil meta for nil usage, got %v", m)
+	}
+	if m := streamUsageMeta(&openai.Usage{}); m != nil {
+		t.Errorf("expected nil meta for zero usage, got %v", m)
+	}
+	m := streamUsageMeta(&openai.Usage{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3})
+	if m["total_tokens"] != "3" || m["prompt_tokens"] != "1" || m["completion_tokens"] != "2" {
+		t.Errorf("unexpected usage meta: %v", m)
+	}
+}
+
+func TestStreamDoneEvent_nilUsage(t *testing.T) {
+	ev := streamDoneEvent(nil)
+	if ev.Type != EventTypeContentDone || !ev.Done {
+		t.Fatalf("unexpected event: %+v", ev)
+	}
+	if ev.Meta != nil {
+		t.Errorf("expected nil meta, got %v", ev.Meta)
+	}
+}
+
+func TestStreamDoneEvent_withUsage(t *testing.T) {
+	ev := streamDoneEvent(&openai.Usage{TotalTokens: 42})
+	if ev.Meta == nil || ev.Meta["total_tokens"] != "42" {
+		t.Errorf("expected total_tokens=42 in meta, got %v", ev.Meta)
 	}
 }
 

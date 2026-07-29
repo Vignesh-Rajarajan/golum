@@ -297,6 +297,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.messages[len(m.messages)-1].Content = cleaned
 				m.ctxMgr.AddAssistantMessage(cleaned, nil)
 			}
+			m.streaming = false
 			u := contextmgr.TokenUsageFromMeta(msg.Event.Meta)
 			if u.TotalTokens > 0 || u.PromptTokens > 0 || u.CompletionTokens > 0 {
 				m.ctxMgr.SetLatestUsage(u)
@@ -434,7 +435,7 @@ func (m *Model) renderStyledMessagesView() string {
 	}
 
 	if m.showStreamingSpinner() {
-		spinnerText := m.styles.Chat.Thinking.Render(m.spinner.View() + " Waiting for response…")
+		spinnerText := m.styles.Chat.Thinking.Render(m.spinner.View() + " Waiting for response")
 		renderedMessages = append(renderedMessages, spinnerText)
 	}
 
@@ -682,7 +683,7 @@ func (m *Model) syncSelectableBuffer() {
 			Kind: selectableLineHeader,
 		})
 		seeds = append(seeds, lineSeed{
-			Text: "Waiting for response…",
+			Text: "Waiting for response",
 			Role: RoleAssistant,
 			Kind: selectableLineMeta,
 		})
