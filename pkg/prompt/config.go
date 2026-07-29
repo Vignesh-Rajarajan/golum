@@ -7,4 +7,5 @@ type PromptConfig struct {
 	CWD                   string
 	DeveloperInstructions string
 	UserInstructions      string
+	SkillsSection         string // optional pre-formatted skills section from pkg/skill
 }

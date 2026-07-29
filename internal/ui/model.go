@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textinput"
@@ -15,39 +14,44 @@ import (
 	"github.com/Vignesh-Rajarajan/golum/internal/ui/styles"
 	"github.com/Vignesh-Rajarajan/golum/pkg/applog"
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
-	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
-	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
+	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
+	"github.com/Vignesh-Rajarajan/golum/pkg/harness"
+	"github.com/Vignesh-Rajarajan/golum/pkg/harness/session"
 	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
-	"github.com/Vignesh-Rajarajan/golum/pkg/sanitize"
+	"github.com/Vignesh-Rajarajan/golum/pkg/skill"
+	"github.com/Vignesh-Rajarajan/golum/pkg/tool"
 	"github.com/mattn/go-runewidth"
 )
 
 type Model struct {
 	styles                styles.Styles
-	client                *llm.Client
 	cfg                   *config.Config
-	ctxMgr                *contextmgr.ContextManager
+	harness               *harness.AgentHarness
+	approvals             *approvalBroker
 	messages              []Message
 	input                 textinput.Model
 	spinner               spinner.Model
 	viewport              viewport.Model
 	scrollMode            bool
 	streaming             bool
+	awaitingApproval      bool
+	approvalSummary       string
+	thinkingExpanded      bool
 	ready                 bool
 	width                 int
 	height                int
 	err                   error
 	ctx                   context.Context
-	streamReader          *streamReader
-	streamCancel          context.CancelFunc
-	streamCancelled       bool // user aborted; ignore late deltas until stream ends
-	skipScrollAfterStream bool // avoid copy-mode after a cancelled stream
+	eventReader           *agentEventReader
+	streamCancelled       bool
+	skipScrollAfterStream bool
 	selectionMode         bool
 	selectionAnchor       selectionPos
 	selectionCursor       selectionPos
 	selectableText        string
 	selectableLines       []selectableLine
 	copyStatus            string
+	todosPanel            string
 }
 
 type selectionPos struct {
@@ -76,7 +80,15 @@ func NewModel(cfg *config.Config) Model {
 	s := styles.DefaultStyles()
 
 	ti := textinput.New()
-	ti.SetStyles(textinput.DefaultDarkStyles())
+	tiStyles := textinput.DefaultDarkStyles()
+	tiStyles.Focused.Prompt = lipgloss.NewStyle().Foreground(s.Primary)
+	tiStyles.Focused.Text = lipgloss.NewStyle().Foreground(s.FgBase)
+	tiStyles.Focused.Placeholder = lipgloss.NewStyle().Foreground(s.FgSubtle)
+	tiStyles.Blurred.Prompt = lipgloss.NewStyle().Foreground(s.FgSubtle)
+	tiStyles.Blurred.Text = lipgloss.NewStyle().Foreground(s.FgMuted)
+	tiStyles.Blurred.Placeholder = lipgloss.NewStyle().Foreground(s.FgSubtle)
+	tiStyles.Cursor.Color = s.Primary
+	ti.SetStyles(tiStyles)
 	ti.Placeholder = "Type your message..."
 	ti.CharLimit = 0
 	ti.Prompt = "> "
@@ -90,18 +102,52 @@ func NewModel(cfg *config.Config) Model {
 	if err != nil {
 		cwd = ""
 	}
-	ctxMgr := contextmgr.NewContextManager(cfg, prompt.PromptConfig{CWD: cwd}, nil, nil)
+	env, err := execenv.NewOsExecutionEnv(cwd)
+	if err != nil {
+		applog.Printf("ui: execenv: %v", err)
+		env, _ = execenv.NewOsExecutionEnv(".")
+	}
+	reg, todos := tool.DefaultRegistry(nil)
+
+	promptCfg := prompt.PromptConfig{CWD: cwd}
+	if skills, err := skill.LoadSkills(context.Background(), env); err == nil && len(skills) > 0 {
+		promptCfg.SkillsSection = skill.FormatSkillsSection(skills)
+	}
+
+	broker := newApprovalBroker()
+
+	var sess session.Session
+	if dir, err := session.DefaultSessionsDir(); err == nil {
+		if repo, err := session.NewFileSessionRepo(dir, cfg, promptCfg, reg.AsLLMTools()); err == nil {
+			if created, err := repo.Create(context.Background()); err == nil {
+				sess = created
+			}
+		}
+	}
+
+	h, err := harness.NewAgentHarness(harness.HarnessConfig{
+		Config:    cfg,
+		Env:       env,
+		Registry:  reg,
+		Todos:     todos,
+		Session:   sess,
+		Approvals: broker,
+		PromptCfg: promptCfg,
+	})
+	if err != nil {
+		applog.Printf("ui: harness: %v", err)
+	}
 
 	m := Model{
-		styles:   s,
-		client:   llm.NewClient(cfg),
-		cfg:      cfg,
-		ctxMgr:   ctxMgr,
-		messages: make([]Message, 0),
-		input:    ti,
-		spinner:  sp,
-		viewport: vp,
-		ctx:      context.Background(),
+		styles:    s,
+		cfg:       cfg,
+		harness:   h,
+		approvals: broker,
+		messages:  make([]Message, 0),
+		input:     ti,
+		spinner:   sp,
+		viewport:  vp,
+		ctx:       context.Background(),
 	}
 	return m
 }
@@ -141,6 +187,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		key := msg.Key()
+
+		// Approval gate — y/n only while awaiting approval
+		if m.awaitingApproval {
+			switch key.String() {
+			case "y", "Y":
+				m.awaitingApproval = false
+				m.approvalSummary = ""
+				m.approvals.Decide(true)
+				m.syncViewportContent()
+				return m, nil
+			case "n", "N":
+				m.awaitingApproval = false
+				m.approvalSummary = ""
+				m.approvals.Decide(false)
+				m.syncViewportContent()
+				return m, nil
+			case "esc":
+				if m.streaming {
+					m.abortStream()
+					m.syncViewportContent()
+				}
+				return m, nil
+			default:
+				return m, nil
+			}
+		}
+
+		if key.String() == "t" && !m.scrollMode && !m.streaming {
+			m.thinkingExpanded = !m.thinkingExpanded
+			for i := range m.messages {
+				if m.messages[i].Role == RoleThinking {
+					m.messages[i].Collapsed = !m.thinkingExpanded
+				}
+			}
+			m.syncViewportContent()
+			return m, nil
+		}
+
 		if m.scrollMode {
 			if key.Mod&tea.ModCtrl != 0 {
 				switch key.Code {
@@ -220,7 +304,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case 'l':
 				if !m.streaming && !m.scrollMode {
 					m.messages = nil
-					m.ctxMgr.Clear()
+					m.todosPanel = ""
+					if m.harness != nil {
+						cwd, _ := os.Getwd()
+						promptCfg := prompt.PromptConfig{CWD: cwd}
+						m.startNewSession(promptCfg)
+					}
 					m.copyStatus = ""
 					m.syncViewportContent()
 					return m, m.input.Focus()
@@ -243,88 +332,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case tea.MouseWheelMsg:
-		var cmd tea.Cmd
-		m.viewport, cmd = m.viewport.Update(msg)
-		cmds = append(cmds, cmd)
-
 	case InputSubmitMsg:
 		m.messages = append(m.messages, Message{
 			Role:    RoleUser,
 			Content: msg.Text,
 		})
-		m.ctxMgr.AddUserMessage(msg.Text)
 		m.streaming = true
 		m.syncViewportContent()
 		m.viewport.GotoBottom()
-		return m, m.startStream()
+		return m, m.startAgent(msg.Text)
 
-	case StreamMsg:
-		if msg.Event.Type == llm.EventTypeContentDelta {
-			if m.streamCancelled {
-				m.syncViewportContent()
-				if m.streamReader != nil {
-					return m, m.streamReader.Read()
-				}
-				return m, nil
-			}
-			if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
-				m.messages[len(m.messages)-1].Content += msg.Event.Content
-			} else {
-				m.messages = append(m.messages, Message{
-					Role:    RoleAssistant,
-					Content: msg.Event.Content,
-				})
-			}
-			m.viewport.GotoBottom()
-		} else if msg.Event.Type == llm.EventTypeContentDone {
-			if msg.Event.Cancelled {
-				m.streaming = false
-				m.streamCancelled = false
-				m.skipScrollAfterStream = true
-				if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
-					m.messages = m.messages[:len(m.messages)-1]
-				}
-				m.syncViewportContent()
-				if m.streamReader != nil {
-					return m, m.streamReader.Read()
-				}
-				return m, nil
-			}
-			if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
-				m.messages[len(m.messages)-1].Meta = msg.Event.Meta
-				cleaned := sanitize.StripPseudoToolMarkup(m.messages[len(m.messages)-1].Content)
-				m.messages[len(m.messages)-1].Content = cleaned
-				m.ctxMgr.AddAssistantMessage(cleaned, nil)
-			}
-			m.streaming = false
-			u := contextmgr.TokenUsageFromMeta(msg.Event.Meta)
-			if u.TotalTokens > 0 || u.PromptTokens > 0 || u.CompletionTokens > 0 {
-				m.ctxMgr.SetLatestUsage(u)
-				m.ctxMgr.AddUsage(u)
-			}
-		} else if msg.Event.Type == llm.EventTypeError {
-			applog.Printf("stream error: %v", msg.Event.Error)
-			m.streaming = false
-			m.messages = append(m.messages, Message{
-				Role:    RoleError,
-				Content: fmt.Sprintf("Error: %v", msg.Event.Error),
-			})
-			m.viewport.GotoBottom()
-		}
+	case AgentEventMsg:
+		m.handleAgentEvent(msg.Event)
 		m.syncViewportContent()
-		if m.streamReader != nil {
-			return m, m.streamReader.Read()
+		if m.eventReader != nil {
+			return m, m.eventReader.Read()
 		}
 		return m, nil
 
-	case StreamDoneMsg:
+	case AgentDoneMsg:
 		if m.streaming {
 			m.streaming = false
 		}
-		m.streamReader = nil
+		m.awaitingApproval = false
+		m.eventReader = nil
 		m.streamCancelled = false
-		m.releaseStreamCancel()
 		m.syncViewportContent()
 		longReply := m.viewport.TotalLineCount() > m.viewport.VisibleLineCount()
 		if longReply && !m.skipScrollAfterStream {
@@ -334,6 +366,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.input.Focus())
 		}
 		m.skipScrollAfterStream = false
+
+		// Auto-compact hint path: prune if needed
+		if m.harness != nil && m.harness.NeedsCompression() {
+			applog.Printf("ui: context near limit — consider compaction")
+		}
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -374,15 +411,17 @@ func (m Model) View() tea.View {
 	b.WriteString("\n")
 
 	var statusText string
-	if m.streaming {
-		statusText = m.styles.Chat.Thinking.Render("Generating response… · Esc cancels")
+	if m.awaitingApproval {
+		statusText = m.styles.Chat.Footer.Render("Approve tool? [y]es / [n]o · Esc cancels turn · " + m.approvalSummary)
+	} else if m.streaming {
+		statusText = m.styles.Chat.Thinking.Render("Working… · Esc cancels")
 	} else if m.scrollMode {
 		statusText = m.styles.Chat.Footer.Render("Scroll long reply · ←/→/↑/↓ or h/j/k/l: move | v: select | y: copy | Ctrl+A: all | i/Esc: type")
 		if m.copyStatus != "" {
 			statusText = m.styles.Chat.Footer.Render(m.copyStatus + " | v: select | y: copy | Ctrl+A: all | i/Esc: type")
 		}
 	} else {
-		line := "Enter to send · Esc: scroll/copy · Ctrl+L: clear chat · mouse wheel · Ctrl+C quit"
+		line := "Enter to send · Esc: scroll/copy · Ctrl+L: new session · Ctrl+C quit"
 		if hint := m.sessionFooterHint(); hint != "" {
 			line = hint + " · " + line
 		}
@@ -400,7 +439,6 @@ func (m Model) View() tea.View {
 	v := tea.NewView(b.String())
 	v.BackgroundColor = m.styles.BgBase
 	v.AltScreen = true
-	v.MouseMode = tea.MouseModeAllMotion
 
 	if m.input.Focused() {
 		cursor := m.input.Cursor()
@@ -509,6 +547,10 @@ func (m Model) selectableLineStyle(line selectableLine) lipgloss.Style {
 			return lipgloss.NewStyle().Bold(true).Foreground(m.styles.GreenDark)
 		case RoleError:
 			return lipgloss.NewStyle().Bold(true).Foreground(m.styles.Error)
+		case RoleToolCall, RoleToolResult:
+			return lipgloss.NewStyle().Bold(true).Foreground(m.styles.FgMuted)
+		case RoleThinking:
+			return lipgloss.NewStyle().Bold(true).Foreground(m.styles.FgSubtle)
 		default:
 			return lipgloss.NewStyle().Bold(true).Foreground(m.styles.FgMuted)
 		}
@@ -518,6 +560,8 @@ func (m Model) selectableLineStyle(line selectableLine) lipgloss.Style {
 		switch line.Role {
 		case RoleError:
 			return lipgloss.NewStyle().Foreground(m.styles.Error)
+		case RoleThinking:
+			return lipgloss.NewStyle().Foreground(m.styles.FgSubtle)
 		default:
 			return lipgloss.NewStyle().Foreground(m.styles.FgBase)
 		}
@@ -785,6 +829,12 @@ func selectableHeader(role MessageRole) string {
 		return "Error"
 	case RoleSystem:
 		return "System"
+	case RoleToolCall:
+		return "Tool"
+	case RoleToolResult:
+		return "Result"
+	case RoleThinking:
+		return "Thinking"
 	default:
 		return "Message"
 	}
@@ -856,8 +906,8 @@ func clampInt(v, minV, maxV int) int {
 	return v
 }
 
-func (m Model) showStreamingSpinner() bool {
-	if !m.streaming {
+func (m *Model) showStreamingSpinner() bool {
+	if !m.streaming || m.awaitingApproval {
 		return false
 	}
 	if len(m.messages) == 0 {
@@ -876,72 +926,189 @@ func (m *Model) sendMessage(text string) tea.Cmd {
 	}
 }
 
-func (m *Model) releaseStreamCancel() {
-	if m.streamCancel != nil {
-		m.streamCancel()
-		m.streamCancel = nil
-	}
-}
-
-// abortStream cancels the in-flight API request, drops any partial assistant bubble, and
-// suppresses auto-entering scroll/copy mode when the stream ends.
 func (m *Model) abortStream() {
 	m.skipScrollAfterStream = true
-	if m.streamCancel != nil {
-		m.streamCancel()
+	m.awaitingApproval = false
+	if m.approvals != nil {
+		m.approvals.Decide(false)
+	}
+	if m.harness != nil {
+		m.harness.Abort()
 	}
 	m.streamCancelled = true
 	m.streaming = false
-	if len(m.messages) == 0 {
+}
+
+func (m *Model) startAgent(text string) tea.Cmd {
+	m.streamCancelled = false
+	m.skipScrollAfterStream = false
+	m.awaitingApproval = false
+
+	if m.harness == nil {
+		return func() tea.Msg {
+			return AgentEventMsg{Event: harness.AgentEvent{
+				Type: harness.EventError,
+				Err:  fmt.Errorf("harness not initialized"),
+			}}
+		}
+	}
+
+	applog.Printf("ui: startAgent")
+	events, err := m.harness.Prompt(m.ctx, text)
+	if err != nil {
+		return func() tea.Msg {
+			return AgentEventMsg{Event: harness.AgentEvent{Type: harness.EventError, Err: err}}
+		}
+	}
+	m.eventReader = &agentEventReader{events: events}
+	return m.eventReader.Read()
+}
+
+func (m *Model) handleAgentEvent(ev harness.AgentEvent) {
+	if m.streamCancelled && ev.Type != harness.EventTurnDone && ev.Type != harness.EventContentDone {
 		return
 	}
-	last := m.messages[len(m.messages)-1]
-	if last.Role == RoleAssistant {
-		m.messages = m.messages[:len(m.messages)-1]
+	switch ev.Type {
+	case harness.EventContentDelta:
+		if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
+			m.messages[len(m.messages)-1].Content += ev.Content
+		} else {
+			m.messages = append(m.messages, Message{Role: RoleAssistant, Content: ev.Content})
+		}
+		m.viewport.GotoBottom()
+	case harness.EventThinkingDelta:
+		collapsed := !m.thinkingExpanded
+		if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleThinking {
+			m.messages[len(m.messages)-1].Content += ev.Content
+		} else {
+			m.messages = append(m.messages, Message{Role: RoleThinking, Content: ev.Content, Collapsed: collapsed})
+		}
+	case harness.EventContentDone:
+		if ev.Cancelled {
+			m.streaming = false
+			m.streamCancelled = false
+			m.skipScrollAfterStream = true
+			return
+		}
+		if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleAssistant {
+			m.messages[len(m.messages)-1].Meta = ev.Meta
+		}
+	case harness.EventToolCallStart:
+		name := ""
+		if ev.ToolCall != nil {
+			name = ev.ToolCall.Name
+			if ev.ToolCall.RawArguments != "" {
+				name = fmt.Sprintf("%s %s", ev.ToolCall.Name, truncateRunes(ev.ToolCall.RawArguments, 60))
+			}
+		}
+		m.messages = append(m.messages, Message{Role: RoleToolCall, Content: name})
+		m.viewport.GotoBottom()
+	case harness.EventToolCallAwaitingApproval:
+		m.awaitingApproval = true
+		if ev.ToolCall != nil {
+			m.approvalSummary = fmt.Sprintf("%s %s", ev.ToolCall.Name, truncateRunes(ev.ToolCall.RawArguments, 80))
+		}
+	case harness.EventToolCallResult:
+		summary := ""
+		isErr := false
+		if ev.ToolResult != nil {
+			isErr = ev.ToolResult.IsError
+			if ev.ToolResult.Display != "" {
+				summary = ev.ToolResult.Display
+			} else {
+				summary = truncateRunes(ev.ToolResult.Content, 80)
+			}
+			body := ev.ToolResult.Content
+			m.messages = append(m.messages, Message{
+				Role:    RoleToolResult,
+				Content: summary + "\n" + body,
+				IsError: isErr,
+			})
+		}
+		m.viewport.GotoBottom()
+	case harness.EventTodosChanged:
+		m.todosPanel = tool.FormatTodosForDisplay(ev.Todos)
+	case harness.EventError:
+		applog.Printf("agent error: %v", ev.Err)
+		m.streaming = false
+		m.awaitingApproval = false
+		errMsg := "unknown error"
+		if ev.Err != nil {
+			errMsg = ev.Err.Error()
+		}
+		m.messages = append(m.messages, Message{Role: RoleError, Content: "Error: " + errMsg})
+		m.viewport.GotoBottom()
+	case harness.EventTurnDone:
+		m.streaming = false
+		m.awaitingApproval = false
+		if ev.Cancelled {
+			m.skipScrollAfterStream = true
+			m.streamCancelled = false
+		}
 	}
 }
 
-func (m *Model) startStream() tea.Cmd {
-	m.releaseStreamCancel()
-	m.streamCancelled = false
-	m.skipScrollAfterStream = false
+func (m *Model) startNewSession(promptCfg prompt.PromptConfig) {
+	todos := tool.NewTodoStore()
+	reg := m.harness.Registry()
+	reg.Register(tool.NewTodosTool(todos))
 
-	history := m.ctxMgr.ChatCompletionMessages()
-
-	timeout := 10 * time.Minute
-	if m.cfg != nil {
-		timeout = m.cfg.StreamTimeoutOrDefault()
+	var sess session.Session
+	if dir, err := session.DefaultSessionsDir(); err == nil {
+		if repo, err := session.NewFileSessionRepo(dir, m.cfg, promptCfg, reg.AsLLMTools()); err == nil {
+			if created, err := repo.Create(context.Background()); err == nil {
+				sess = created
+			}
+		}
 	}
-	applog.Printf("ui: startStream history_msgs=%d timeout=%s", len(history), timeout)
-
-	opts := llm.ChatCompletionOptions{
-		Stream:     true,
-		MaxRetries: 3,
-		Timeout:    timeout,
+	h, err := harness.NewAgentHarness(harness.HarnessConfig{
+		Config:    m.cfg,
+		Env:       m.harness.Env(),
+		Registry:  reg,
+		Todos:     todos,
+		Session:   sess,
+		Approvals: m.approvals,
+		PromptCfg: promptCfg,
+	})
+	if err != nil {
+		m.harness.NewSession(m.cfg, promptCfg)
+		return
 	}
+	m.harness = h
+}
 
-	streamCtx, cancel := context.WithCancel(m.ctx)
-	m.streamCancel = cancel
-
-	events := m.client.ChatCompletion(streamCtx, history, opts)
-	m.streamReader = &streamReader{events: events}
-	return m.streamReader.Read()
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
 }
 
 func (m Model) sessionFooterHint() string {
-	if m.ctxMgr == nil {
+	if m.harness == nil || m.harness.Session() == nil {
 		return ""
 	}
-	tu := m.ctxMgr.TotalUsage
+	cm := m.harness.Session().ContextManager()
+	if cm == nil {
+		return ""
+	}
+	tu := cm.TotalUsage
 	var b strings.Builder
 	if tu.TotalTokens > 0 {
 		fmt.Fprintf(&b, "session Σ %d tok", tu.TotalTokens)
 	}
-	if m.ctxMgr.NeedsCompression() {
+	if cm.NeedsCompression() {
 		if b.Len() > 0 {
 			b.WriteString(" · ")
 		}
 		b.WriteString("last response >80% context — summarize or start fresh")
+	}
+	if m.todosPanel != "" {
+		if b.Len() > 0 {
+			b.WriteString(" · ")
+		}
+		b.WriteString("todos updated")
 	}
 	return b.String()
 }

@@ -41,11 +41,14 @@ type MockResponse struct {
 
 // MockStreamChunk represents a single chunk in a streaming response
 type MockStreamChunk struct {
-	Content      string
-	FinishReason string
-	ToolCallID   string
-	ToolCallName string
-	Delay        time.Duration
+	Content          string
+	FinishReason     string
+	ToolCallID       string
+	ToolCallName     string
+	ToolCallIndex    *int
+	ToolCallArgsFrag string // fragment of function.arguments JSON
+	Delay            time.Duration
+	RawJSON          string // if set, sent as-is instead of buildChunkData
 }
 
 // NewMockServer creates a new mock server
@@ -117,7 +120,12 @@ func (ms *MockServer) sendStreamResponse(w http.ResponseWriter, response MockRes
 			time.Sleep(chunk.Delay)
 		}
 
-		data := ms.buildChunkData(chunk)
+		var data string
+		if chunk.RawJSON != "" {
+			data = chunk.RawJSON
+		} else {
+			data = ms.buildChunkData(chunk)
+		}
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 	}
@@ -158,16 +166,24 @@ func (ms *MockServer) buildDelta(chunk MockStreamChunk) map[string]interface{} {
 		delta["content"] = chunk.Content
 	}
 
-	if chunk.ToolCallID != "" {
-		delta["tool_calls"] = []map[string]interface{}{
-			{
-				"id":   chunk.ToolCallID,
-				"type": "function",
-				"function": map[string]interface{}{
-					"name": chunk.ToolCallName,
-				},
+	hasTool := chunk.ToolCallID != "" || chunk.ToolCallName != "" || chunk.ToolCallArgsFrag != "" || chunk.ToolCallIndex != nil
+	if hasTool {
+		tc := map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      chunk.ToolCallName,
+				"arguments": chunk.ToolCallArgsFrag,
 			},
 		}
+		if chunk.ToolCallID != "" {
+			tc["id"] = chunk.ToolCallID
+		}
+		if chunk.ToolCallIndex != nil {
+			tc["index"] = *chunk.ToolCallIndex
+		} else {
+			tc["index"] = 0
+		}
+		delta["tool_calls"] = []map[string]interface{}{tc}
 	}
 
 	return delta
@@ -390,9 +406,41 @@ func (b *ChunkBuilder) AddFinish() *ChunkBuilder {
 
 // AddToolCall adds a tool call chunk
 func (b *ChunkBuilder) AddToolCall(id, name string) *ChunkBuilder {
+	idx := 0
 	b.chunks = append(b.chunks, MockStreamChunk{
-		ToolCallID:   id,
-		ToolCallName: name,
+		ToolCallID:    id,
+		ToolCallName:  name,
+		ToolCallIndex: &idx,
+	})
+	return b
+}
+
+// AddToolCallArgsFrag appends an arguments fragment for a tool call at index.
+func (b *ChunkBuilder) AddToolCallArgsFrag(index int, argsFrag string) *ChunkBuilder {
+	idx := index
+	b.chunks = append(b.chunks, MockStreamChunk{
+		ToolCallIndex:    &idx,
+		ToolCallArgsFrag: argsFrag,
+	})
+	return b
+}
+
+// AddToolCallIndexed adds a tool call with explicit index, id, name, and optional args fragment.
+func (b *ChunkBuilder) AddToolCallIndexed(index int, id, name, argsFrag string) *ChunkBuilder {
+	idx := index
+	b.chunks = append(b.chunks, MockStreamChunk{
+		ToolCallID:       id,
+		ToolCallName:     name,
+		ToolCallIndex:    &idx,
+		ToolCallArgsFrag: argsFrag,
+	})
+	return b
+}
+
+// AddFinishToolCalls adds a finish_reason=tool_calls chunk.
+func (b *ChunkBuilder) AddFinishToolCalls() *ChunkBuilder {
+	b.chunks = append(b.chunks, MockStreamChunk{
+		FinishReason: "tool_calls",
 	})
 	return b
 }

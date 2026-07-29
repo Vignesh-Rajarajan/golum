@@ -169,6 +169,30 @@ func TestTruncateDesc_keepsShortDescriptionUnchanged(t *testing.T) {
 	}
 }
 
+func TestGetSystemPrompt_NoTools_IncludesChatClientSection(t *testing.T) {
+	out := GetSystemPrompt(PromptConfig{CWD: "/tmp"}, nil, nil)
+	if !strings.Contains(out, "Golum chat client") {
+		t.Fatal("expected chat-client section when tools are disabled")
+	}
+}
+
+func TestGetSystemPrompt_WithTools_OmitsChatClientSection(t *testing.T) {
+	tools := []llm.Tool{{Type: "function", Function: llm.ToolFunction{Name: "read_file", Description: "Read"}}}
+	out := GetSystemPrompt(PromptConfig{CWD: "/tmp"}, nil, tools)
+	if strings.Contains(out, "Golum chat client") {
+		t.Fatal("chat-client section must be gated off when tools are enabled")
+	}
+	if strings.Contains(out, "does not execute tools, shells, or agent function calls") {
+		t.Fatal("must not forbid tools when tools are registered")
+	}
+	if strings.Contains(out, "`memory`") {
+		t.Fatal("must not mention unregistered memory tool")
+	}
+	if strings.Contains(out, "`apply_patch`") {
+		t.Fatal("must not mention unregistered apply_patch tool")
+	}
+}
+
 func TestGetCompressionPrompt(t *testing.T) {
 	if !strings.Contains(GetCompressionPrompt(), "ORIGINAL GOAL") {
 		t.Fatal("expected compression template sections")

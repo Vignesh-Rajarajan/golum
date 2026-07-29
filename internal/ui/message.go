@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	"charm.land/glamour/v2"
@@ -12,16 +13,21 @@ import (
 type MessageRole string
 
 const (
-	RoleUser      MessageRole = "user"
-	RoleAssistant MessageRole = "assistant"
-	RoleSystem    MessageRole = "system"
-	RoleError     MessageRole = "error"
+	RoleUser       MessageRole = "user"
+	RoleAssistant  MessageRole = "assistant"
+	RoleSystem     MessageRole = "system"
+	RoleError      MessageRole = "error"
+	RoleToolCall   MessageRole = "tool_call"
+	RoleToolResult MessageRole = "tool_result"
+	RoleThinking   MessageRole = "thinking"
 )
 
 type Message struct {
 	Role    MessageRole
 	Content string
 	Meta    map[string]string
+	IsError bool
+	Collapsed bool // for thinking blocks
 }
 
 func (m Message) Render(width int, s styles.Styles) string {
@@ -33,7 +39,8 @@ func (m Message) Render(width int, s styles.Styles) string {
 		content = sanitize.StripPseudoToolMarkup(content)
 	}
 
-	if m.Role == RoleUser {
+	switch m.Role {
+	case RoleUser:
 		header := styles.ApplyBoldForegroundGrad(&s, "You", s.Primary, s.Secondary)
 		contentStyle := s.Chat.UserMessage.Width(width - 2)
 		rendered = lipgloss.JoinVertical(
@@ -41,9 +48,45 @@ func (m Message) Render(width int, s styles.Styles) string {
 			header,
 			contentStyle.Render(content),
 		)
-	} else if m.Role == RoleError {
+	case RoleError:
 		rendered = s.Chat.ErrorMessage.Render(content)
-	} else {
+	case RoleToolCall:
+		icon := styles.ToolPending
+		line := fmt.Sprintf("%s %s", icon, content)
+		rendered = lipgloss.NewStyle().Foreground(s.FgMuted).Render(line)
+	case RoleToolResult:
+		icon := styles.ToolSuccess
+		if m.IsError {
+			icon = styles.ToolError
+		}
+		header := lipgloss.NewStyle().Foreground(s.FgMuted).Render(fmt.Sprintf("%s %s", icon, firstLine(content)))
+		body := content
+		if idx := strings.Index(content, "\n"); idx >= 0 {
+			body = content[idx+1:]
+		} else {
+			body = ""
+		}
+		if strings.TrimSpace(body) == "" {
+			rendered = header
+		} else {
+			border := lipgloss.NewStyle().
+				BorderLeft(true).
+				BorderStyle(lipgloss.NormalBorder()).
+				BorderForeground(s.Border).
+				PaddingLeft(1).
+				Width(width - 2).
+				Foreground(s.FgBase)
+			rendered = lipgloss.JoinVertical(lipgloss.Left, header, border.Render(strings.TrimRight(body, "\n")))
+		}
+	case RoleThinking:
+		if m.Collapsed {
+			rendered = s.Chat.Thinking.Render("⋯ thinking (press t to expand)")
+		} else {
+			header := s.Chat.Thinking.Render("Thinking:")
+			body := s.Chat.Thinking.Width(width - 2).Render(content)
+			rendered = lipgloss.JoinVertical(lipgloss.Left, header, body)
+		}
+	default:
 		header := styles.ApplyBoldForegroundGrad(&s, "Assistant", s.GreenDark, s.Tertiary)
 
 		md, err := glamour.NewTermRenderer(
@@ -87,4 +130,11 @@ func (m Message) Render(width int, s styles.Styles) string {
 	}
 
 	return rendered
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }

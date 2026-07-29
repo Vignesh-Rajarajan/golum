@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -787,9 +788,12 @@ func TestStreamUsageMeta_nilAndZero(t *testing.T) {
 }
 
 func TestStreamDoneEvent_nilUsage(t *testing.T) {
-	ev := streamDoneEvent(nil)
+	ev := streamDoneEvent(nil, "stop")
 	if ev.Type != EventTypeContentDone || !ev.Done {
 		t.Fatalf("unexpected event: %+v", ev)
+	}
+	if ev.FinishReason != "stop" {
+		t.Errorf("expected FinishReason stop, got %q", ev.FinishReason)
 	}
 	if ev.Meta != nil {
 		t.Errorf("expected nil meta, got %v", ev.Meta)
@@ -797,9 +801,258 @@ func TestStreamDoneEvent_nilUsage(t *testing.T) {
 }
 
 func TestStreamDoneEvent_withUsage(t *testing.T) {
-	ev := streamDoneEvent(&openai.Usage{TotalTokens: 42})
+	ev := streamDoneEvent(&openai.Usage{TotalTokens: 42}, "tool_calls")
 	if ev.Meta == nil || ev.Meta["total_tokens"] != "42" {
 		t.Errorf("expected total_tokens=42 in meta, got %v", ev.Meta)
+	}
+	if ev.FinishReason != "tool_calls" {
+		t.Errorf("expected FinishReason tool_calls, got %q", ev.FinishReason)
+	}
+}
+
+func TestChatCompletion_StreamingToolCallArgsSplitAcrossChunks(t *testing.T) {
+	ms := NewMockServer()
+	defer ms.Close()
+
+	chunks := NewChunkBuilder().
+		AddToolCallIndexed(0, "call_1", "read_file", `{"pa`).
+		AddToolCallArgsFrag(0, `th":"RE`).
+		AddToolCallArgsFrag(0, `ADME.md"}`).
+		AddFinishToolCalls().
+		Build()
+	ms.AddStreamingResponse(chunks, 200)
+
+	client := ms.TestClient()
+	events := CollectEventsSync(client.ChatCompletion(context.Background(), []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "read"},
+	}, ChatCompletionOptions{Stream: true, MaxRetries: 0}))
+
+	var toolEvents []StreamEvent
+	var done *StreamEvent
+	for i := range events {
+		switch events[i].Type {
+		case EventTypeToolCall:
+			toolEvents = append(toolEvents, events[i])
+		case EventTypeContentDone:
+			done = &events[i]
+		}
+	}
+	if len(toolEvents) != 1 {
+		t.Fatalf("expected exactly 1 tool call event (not per-chunk), got %d", len(toolEvents))
+	}
+	tc := toolEvents[0].Tool
+	if tc == nil || tc.Name != "read_file" || tc.ID != "call_1" {
+		t.Fatalf("unexpected tool: %+v", tc)
+	}
+	if tc.ArgsErr != nil {
+		t.Fatalf("unexpected ArgsErr: %v", tc.ArgsErr)
+	}
+	if tc.Arguments["path"] != "README.md" {
+		t.Fatalf("path = %v want README.md; raw=%q", tc.Arguments["path"], tc.RawArguments)
+	}
+	if done == nil || done.FinishReason != "tool_calls" {
+		t.Fatalf("expected FinishReason tool_calls, got %+v", done)
+	}
+}
+
+func TestChatCompletion_StreamingParallelToolCallsInterleaved(t *testing.T) {
+	ms := NewMockServer()
+	defer ms.Close()
+
+	chunks := NewChunkBuilder().
+		AddToolCallIndexed(0, "call_a", "read_file", `{"path":"a.go"}`).
+		AddToolCallIndexed(1, "call_b", "list_dir", `{"path":"."}`).
+		AddToolCallArgsFrag(0, ``). // no-op fragment; already complete
+		AddFinishToolCalls().
+		Build()
+	ms.AddStreamingResponse(chunks, 200)
+
+	client := ms.TestClient()
+	events := CollectEventsSync(client.ChatCompletion(context.Background(), []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "explore"},
+	}, ChatCompletionOptions{Stream: true, MaxRetries: 0}))
+
+	var toolEvents []StreamEvent
+	for i := range events {
+		if events[i].Type == EventTypeToolCall {
+			toolEvents = append(toolEvents, events[i])
+		}
+	}
+	if len(toolEvents) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d", len(toolEvents))
+	}
+	// Stable sorted-by-index order
+	if toolEvents[0].Tool.ID != "call_a" || toolEvents[1].Tool.ID != "call_b" {
+		t.Fatalf("expected call_a then call_b, got %q then %q",
+			toolEvents[0].Tool.ID, toolEvents[1].Tool.ID)
+	}
+	if toolEvents[0].Tool.Arguments["path"] != "a.go" {
+		t.Fatalf("call_a path = %v", toolEvents[0].Tool.Arguments["path"])
+	}
+	if toolEvents[1].Tool.Arguments["path"] != "." {
+		t.Fatalf("call_b path = %v", toolEvents[1].Tool.Arguments["path"])
+	}
+}
+
+func TestChatCompletion_StreamingMalformedToolArgsStillEmitted(t *testing.T) {
+	ms := NewMockServer()
+	defer ms.Close()
+
+	chunks := NewChunkBuilder().
+		AddToolCallIndexed(0, "call_bad", "read_file", `{"path":`).
+		AddFinishToolCalls().
+		Build()
+	ms.AddStreamingResponse(chunks, 200)
+
+	client := ms.TestClient()
+	events := CollectEventsSync(client.ChatCompletion(context.Background(), []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "x"},
+	}, ChatCompletionOptions{Stream: true, MaxRetries: 0}))
+
+	var toolEvents []StreamEvent
+	for i := range events {
+		if events[i].Type == EventTypeToolCall {
+			toolEvents = append(toolEvents, events[i])
+		}
+	}
+	if len(toolEvents) != 1 {
+		t.Fatalf("expected 1 tool event even with malformed JSON, got %d", len(toolEvents))
+	}
+	if toolEvents[0].Tool.ArgsErr == nil {
+		t.Fatal("expected ArgsErr")
+	}
+	if toolEvents[0].Tool.ID != "call_bad" {
+		t.Fatalf("must still emit ID, got %q", toolEvents[0].Tool.ID)
+	}
+}
+
+func TestChatCompletion_StreamingZeroArgTool(t *testing.T) {
+	ms := NewMockServer()
+	defer ms.Close()
+
+	chunks := NewChunkBuilder().
+		AddToolCallIndexed(0, "call_z", "todos", ``).
+		AddFinishToolCalls().
+		Build()
+	ms.AddStreamingResponse(chunks, 200)
+
+	client := ms.TestClient()
+	events := CollectEventsSync(client.ChatCompletion(context.Background(), []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "x"},
+	}, ChatCompletionOptions{Stream: true, MaxRetries: 0}))
+
+	var toolEvents []StreamEvent
+	for i := range events {
+		if events[i].Type == EventTypeToolCall {
+			toolEvents = append(toolEvents, events[i])
+		}
+	}
+	if len(toolEvents) != 1 {
+		t.Fatalf("expected 1 tool event, got %d", len(toolEvents))
+	}
+	tc := toolEvents[0].Tool
+	if tc.Arguments == nil {
+		t.Fatal("zero-arg tool must yield empty map, not nil")
+	}
+	if len(tc.Arguments) != 0 || tc.ArgsErr != nil {
+		t.Fatalf("unexpected args: %+v err=%v", tc.Arguments, tc.ArgsErr)
+	}
+}
+
+func TestChatCompletion_CancelMidToolCallYieldsCancelled(t *testing.T) {
+	ms := NewMockServer()
+	defer ms.Close()
+
+	// Slow chunks so we can cancel mid-stream
+	idx := 0
+	ms.AddStreamingResponse([]MockStreamChunk{
+		{ToolCallID: "call_1", ToolCallName: "shell", ToolCallIndex: &idx, ToolCallArgsFrag: `{"command":"`, Delay: 200 * time.Millisecond},
+		{ToolCallIndex: &idx, ToolCallArgsFrag: `sleep 60"}`, Delay: 5 * time.Second},
+		{FinishReason: "tool_calls"},
+	}, 200)
+
+	client := ms.TestClient()
+	ctx, cancel := context.WithCancel(context.Background())
+	events := client.ChatCompletion(ctx, []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "x"},
+	}, ChatCompletionOptions{Stream: true, MaxRetries: 0})
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	collected := CollectEvents(events, 3*time.Second)
+	var cancelled bool
+	var sawError bool
+	for _, ev := range collected {
+		if ev.Type == EventTypeContentDone && ev.Cancelled {
+			cancelled = true
+		}
+		if ev.Type == EventTypeError {
+			sawError = true
+		}
+	}
+	if !cancelled {
+		t.Fatalf("expected Cancelled:true ContentDone, got events: %+v", collected)
+	}
+	if sawError {
+		t.Fatal("cancellation must not emit EventTypeError")
+	}
+}
+
+func TestChatCompletion_NonStreamingToolCallArguments(t *testing.T) {
+	ms := NewMockServer()
+	defer ms.Close()
+
+	body := map[string]interface{}{
+		"id": "chatcmpl-test", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+		"choices": []map[string]interface{}{{
+			"index": 0,
+			"message": map[string]interface{}{
+				"role":    "assistant",
+				"content": "",
+				"tool_calls": []map[string]interface{}{{
+					"id": "call_ns", "type": "function",
+					"function": map[string]interface{}{
+						"name":      "read_file",
+						"arguments": `{"path":"main.go"}`,
+					},
+				}},
+			},
+			"finish_reason": "tool_calls",
+		}},
+		"usage": map[string]interface{}{"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+	}
+	data, _ := json.Marshal(body)
+	ms.AddResponse(MockResponse{StatusCode: 200, Body: string(data)})
+
+	client := ms.TestClient()
+	events := CollectEventsSync(client.ChatCompletion(context.Background(), []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "x"},
+	}, ChatCompletionOptions{Stream: false, MaxRetries: 0}))
+
+	var toolEvents []StreamEvent
+	var done *StreamEvent
+	for i := range events {
+		switch events[i].Type {
+		case EventTypeToolCall:
+			toolEvents = append(toolEvents, events[i])
+		case EventTypeContentDone:
+			done = &events[i]
+		}
+	}
+	if len(toolEvents) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolEvents))
+	}
+	if toolEvents[0].Tool.Arguments["path"] != "main.go" {
+		t.Fatalf("path = %v", toolEvents[0].Tool.Arguments["path"])
+	}
+	if toolEvents[0].Tool.RawArguments != `{"path":"main.go"}` {
+		t.Fatalf("RawArguments = %q", toolEvents[0].Tool.RawArguments)
+	}
+	if done == nil || done.FinishReason != "tool_calls" {
+		t.Fatalf("expected FinishReason tool_calls, got %+v", done)
 	}
 }
 

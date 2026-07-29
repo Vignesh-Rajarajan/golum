@@ -2,6 +2,8 @@ package llm
 
 import (
 	"time"
+
+	"github.com/sashabaranov/go-openai"
 )
 
 // EventType represents the type of stream event
@@ -11,26 +13,47 @@ const (
 	EventTypeContentDelta EventType = iota // Incremental content chunk
 	EventTypeContentStart                  // Content generation started
 	EventTypeContentDone                   // Content generation completed
-	EventTypeToolCall                      // Tool/function call
+	EventTypeToolCall                      // Tool/function call (complete, after accumulation)
 	EventTypeError                         // Error occurred
+	EventTypeThinkingDelta                 // Reasoning/thinking chunk (not persisted to context)
 )
 
 // StreamEvent represents a single event in the stream
 type StreamEvent struct {
-	Type      EventType
-	Content   string            // For content delta events
-	Error     error             // For error events
-	Tool      *ToolCall         // For tool call events
-	Done      bool              // For completion events
-	Cancelled bool              // True when the request context was cancelled (user abort)
-	Meta      map[string]string // Additional metadata
+	Type         EventType
+	Content      string            // For content / thinking delta events
+	Error        error             // For error events
+	Tool         *ToolCall         // For tool call events
+	Done         bool              // For completion events
+	Cancelled    bool              // True when the request context was cancelled (user abort)
+	FinishReason string            // e.g. "stop", "tool_calls" — set on ContentDone
+	Meta         map[string]string // Additional metadata
 }
 
 // ToolCall represents a tool/function call from the LLM
 type ToolCall struct {
-	ID        string                 // Unique identifier for the tool call
-	Name      string                 // Name of the tool/function
-	Arguments map[string]interface{} // Arguments passed to the tool
+	ID           string                 // Unique identifier for the tool call
+	Name         string                 // Name of the tool/function
+	Arguments    map[string]interface{} // Parsed arguments
+	RawArguments string                 // Verbatim JSON string from the provider
+	ArgsErr      error                  // Non-nil when RawArguments failed to parse
+}
+
+// ToOpenAI echoes the call back into an assistant message. MUST use RawArguments,
+// not a re-marshal of Arguments — providers validate the echoed string and
+// re-marshalling reorders keys and loses number formatting.
+func (t *ToolCall) ToOpenAI() openai.ToolCall {
+	if t == nil {
+		return openai.ToolCall{}
+	}
+	return openai.ToolCall{
+		ID:   t.ID,
+		Type: openai.ToolTypeFunction,
+		Function: openai.FunctionCall{
+			Name:      t.Name,
+			Arguments: t.RawArguments,
+		},
+	}
 }
 
 // ChatCompletionOptions configures the chat completion behavior

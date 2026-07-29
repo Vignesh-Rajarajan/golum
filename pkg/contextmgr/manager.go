@@ -89,6 +89,16 @@ func (m *ContextManager) AddToolResult(toolCallID, content string) {
 	})
 }
 
+// AddSystemNotice appends a system-role interstitial (e.g. loop-breaker notice).
+func (m *ContextManager) AddSystemNotice(content string) {
+	n := tokenizer.CountTokens(content, m.modelName)
+	m.messages = append(m.messages, MessageItem{
+		Role:       openai.ChatMessageRoleSystem,
+		Content:    content,
+		TokenCount: intPtr(n),
+	})
+}
+
 // GetMessages returns system (if any) plus each message as map[string]any (Python get_messages).
 func (m *ContextManager) GetMessages() []map[string]any {
 	out := make([]map[string]any, 0, 1+len(m.messages))

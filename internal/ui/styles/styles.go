@@ -86,36 +86,36 @@ type Styles struct {
 }
 
 func DefaultStyles() Styles {
-	primary := lipgloss.Color("#7D56F4")
-	secondary := lipgloss.Color("#F77800")
-	tertiary := lipgloss.Color("#10B981")
+	primary := lipgloss.Color("#8B5CF6")
+	secondary := lipgloss.Color("#FF9F1C")
+	tertiary := lipgloss.Color("#35D48A")
 
-	bgBase := lipgloss.Color("#1A1B26")
-	bgBaseLighter := lipgloss.Color("#24283B")
-	bgSubtle := lipgloss.Color("#292E42")
-	bgOverlay := lipgloss.Color("#3B4261")
+	bgBase := lipgloss.Color("#12121C")
+	bgBaseLighter := lipgloss.Color("#1B1C2A")
+	bgSubtle := lipgloss.Color("#262A3D")
+	bgOverlay := lipgloss.Color("#3D4160")
 
-	fgBase := lipgloss.Color("#C0CAF5")
-	fgMuted := lipgloss.Color("#A9B1D6")
-	fgHalfMuted := lipgloss.Color("#737AA2")
-	fgSubtle := lipgloss.Color("#565F89")
+	fgBase := lipgloss.Color("#E4E7F7")
+	fgMuted := lipgloss.Color("#B8BFE0")
+	fgHalfMuted := lipgloss.Color("#8890B8")
+	fgSubtle := lipgloss.Color("#656B92")
 
-	border := lipgloss.Color("#3B4261")
-	borderFocus := lipgloss.Color("#7D56F4")
+	border := lipgloss.Color("#454B72")
+	borderFocus := lipgloss.Color("#8B5CF6")
 
-	error := lipgloss.Color("#F7768E")
-	warning := lipgloss.Color("#E0AF68")
-	info := lipgloss.Color("#7AA2F7")
-	success := lipgloss.Color("#9ECE6A")
+	error := lipgloss.Color("#FF5568")
+	warning := lipgloss.Color("#FFD166")
+	info := lipgloss.Color("#4EA8FF")
+	success := lipgloss.Color("#35D48A")
 
 	white := lipgloss.Color("#FFFFFF")
-	blue := lipgloss.Color("#7AA2F7")
-	blueDark := lipgloss.Color("#2D4F9F")
-	green := lipgloss.Color("#9ECE6A")
-	greenDark := lipgloss.Color("#6183BB")
-	red := lipgloss.Color("#F7768E")
-	redDark := lipgloss.Color("#914C54")
-	yellow := lipgloss.Color("#E0AF68")
+	blue := lipgloss.Color("#4EA8FF")
+	blueDark := lipgloss.Color("#2360C7")
+	green := lipgloss.Color("#35D48A")
+	greenDark := lipgloss.Color("#0E9F6E")
+	red := lipgloss.Color("#FF5568")
+	redDark := lipgloss.Color("#C22B45")
+	yellow := lipgloss.Color("#FFD166")
 
 	base := lipgloss.NewStyle().Foreground(fgBase)
 
@@ -160,7 +160,7 @@ func DefaultStyles() Styles {
 	s.Markdown = ansi.StyleConfig{
 		Document: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
-				Color: stringPtr("#C0CAF5"),
+				Color: stringPtr("#E4E7F7"),
 			},
 		},
 		BlockQuote: ansi.StyleBlock{
@@ -174,7 +174,7 @@ func DefaultStyles() Styles {
 		Heading: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
 				BlockSuffix: "\n",
-				Color:       stringPtr("#7AA2F7"),
+				Color:       stringPtr("#4EA8FF"),
 				Bold:        boolPtr(true),
 			},
 		},
@@ -183,7 +183,7 @@ func DefaultStyles() Styles {
 				Prefix:          " ",
 				Suffix:          " ",
 				Color:           stringPtr("#FFFFFF"),
-				BackgroundColor: stringPtr("#7D56F4"),
+				BackgroundColor: stringPtr("#8B5CF6"),
 				Bold:            boolPtr(true),
 			},
 		},
@@ -217,58 +217,58 @@ func DefaultStyles() Styles {
 			Unticked: "[ ] ",
 		},
 		Link: ansi.StylePrimitive{
-			Color:     stringPtr("#7AA2F7"),
+			Color:     stringPtr("#4EA8FF"),
 			Underline: boolPtr(true),
 		},
 		LinkText: ansi.StylePrimitive{
-			Color: stringPtr("#9ECE6A"),
+			Color: stringPtr("#35D48A"),
 			Bold:  boolPtr(true),
 		},
 		Code: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
 				Prefix:          " ",
 				Suffix:          " ",
-				Color:           stringPtr("#F7768E"),
-				BackgroundColor: stringPtr("#3B4261"),
+				Color:           stringPtr("#FF5568"),
+				BackgroundColor: stringPtr("#3D4160"),
 			},
 		},
 		CodeBlock: ansi.StyleCodeBlock{
 			StyleBlock: ansi.StyleBlock{
 				StylePrimitive: ansi.StylePrimitive{
-					Color: stringPtr("#C0CAF5"),
+					Color: stringPtr("#E4E7F7"),
 				},
 				Margin: uintPtr(2),
 			},
 			Chroma: &ansi.Chroma{
 				Text: ansi.StylePrimitive{
-					Color: stringPtr("#C0CAF5"),
+					Color: stringPtr("#E4E7F7"),
 				},
 				Comment: ansi.StylePrimitive{
-					Color: stringPtr("#565F89"),
+					Color: stringPtr("#656B92"),
 				},
 				Keyword: ansi.StylePrimitive{
-					Color: stringPtr("#7D56F4"),
+					Color: stringPtr("#8B5CF6"),
 				},
 				KeywordType: ansi.StylePrimitive{
-					Color: stringPtr("#9ECE6A"),
+					Color: stringPtr("#35D48A"),
 				},
 				Operator: ansi.StylePrimitive{
-					Color: stringPtr("#F7768E"),
+					Color: stringPtr("#FF5568"),
 				},
 				Name: ansi.StylePrimitive{
-					Color: stringPtr("#C0CAF5"),
+					Color: stringPtr("#E4E7F7"),
 				},
 				NameFunction: ansi.StylePrimitive{
-					Color: stringPtr("#7AA2F7"),
+					Color: stringPtr("#4EA8FF"),
 				},
 				LiteralString: ansi.StylePrimitive{
-					Color: stringPtr("#E0AF68"),
+					Color: stringPtr("#FFD166"),
 				},
 				LiteralNumber: ansi.StylePrimitive{
-					Color: stringPtr("#FF9E64"),
+					Color: stringPtr("#FFA657"),
 				},
 				Background: ansi.StylePrimitive{
-					BackgroundColor: stringPtr("#1A1B26"),
+					BackgroundColor: stringPtr("#12121C"),
 				},
 			},
 		},
@@ -297,7 +297,7 @@ func DefaultStyles() Styles {
 	s.Chat.ErrorMessage = lipgloss.NewStyle().
 		Padding(0, 1).
 		Foreground(white).
-		Background(red)
+		Background(redDark)
 
 	s.Chat.InputBox = lipgloss.NewStyle().
 		Padding(0, 1).
@@ -323,7 +323,7 @@ func DefaultStyles() Styles {
 		Padding(0, 1)
 
 	s.Chat.Thinking = lipgloss.NewStyle().
-		Foreground(fgHalfMuted).
+		Foreground(info).
 		Italic(true)
 
 	s.Chat.Spinner = lipgloss.NewStyle().

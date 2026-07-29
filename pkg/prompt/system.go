@@ -36,9 +36,14 @@ func GetSystemPrompt(cfg PromptConfig, userMemory *string, tools []llm.Tool) str
 	if userMemory != nil && strings.TrimSpace(*userMemory) != "" {
 		parts = append(parts, getMemorySection(*userMemory))
 	}
+	if strings.TrimSpace(cfg.SkillsSection) != "" {
+		parts = append(parts, cfg.SkillsSection)
+	}
 
 	parts = append(parts, getOperationalSection(toolsEnabled))
-	parts = append(parts, getGolumChatClientSection())
+	if !toolsEnabled {
+		parts = append(parts, getGolumChatClientSection())
+	}
 
 	return strings.Join(parts, "\n\n")
 }
@@ -172,7 +177,7 @@ func getOperationalSection(toolsEnabled bool) string {
 
 When requested to perform tasks like fixing bugs, adding features, refactoring, or explaining code, follow this sequence:
 
-1. **Understand:** Think about the user's request and the relevant codebase context. Use search tools extensively (in parallel if independent) to understand file structures, existing code patterns, and conventions. Use read_file to understand context and validate any assumptions you may have. If you need to read multiple files, make multiple parallel calls to read_file.
+1. **Understand:** Think about the user's request and the relevant codebase context. Use search tools extensively (in parallel if independent) to understand file structures, existing code patterns, and conventions. Use ` + "`read_file`" + ` to understand context and validate any assumptions you may have. If you need to read multiple files, make multiple parallel calls to read_file.
 
 2. **Plan:** Build a coherent and grounded (based on the understanding in step 1) plan for how you intend to resolve the user's task. For complex tasks, break them down into smaller, manageable subtasks and use the ` + "`todos`" + ` tool to track your progress. Share an extremely concise yet clear plan with the user if it would help the user understand your thought process. As part of the plan, you should use an iterative development process that includes writing unit tests to verify your changes.
 
@@ -180,7 +185,7 @@ When requested to perform tasks like fixing bugs, adding features, refactoring, 
 
 4. **Verify (Tests):** If applicable and feasible, verify the changes using the project's testing procedures. Identify the correct test commands and frameworks by examining 'README' files, build/package configuration (e.g., 'package.json'), or existing test execution patterns. NEVER assume standard test commands.
 
-5. **Verify (Standards):** VERY IMPORTANT: After making code changes, execute the project-specific build, linting and type-checking commands (e.g., 'tsc', 'npm run lint', 'ruff check .' etc.) that you have identified for this project. This ensures code quality and adherence to standards.
+5. **Verify (Standards):** VERY IMPORTANT: After making code changes, execute the project-specific build, linting and type-checking commands that you have identified for this project. This ensures code quality and adherence to standards.
 
 6. **Finalize:** After all verification passes, consider the task complete. Do not remove or revert any changes or created files (like tests). Await the user's next instruction.
 
@@ -190,13 +195,12 @@ You are a coding agent. Please keep going until the query is completely resolved
 
 ## Tool Usage
 
-- **Parallelism:** Execute multiple independent tool calls in parallel when feasible (i.e. searching the codebase, reading multiple files). Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially.
-- **Command Execution:** Use the ` + "`shell`" + ` tool for running shell commands. Before executing commands that modify the file system, codebase, or system state, provide a brief explanation of the command's purpose and potential impact. When searching for text or files, prefer using ` + "`rg`" + ` or ` + "`rg --files`" + ` respectively because ` + "`rg`" + ` is much faster than alternatives like ` + "`grep`" + `. (If the ` + "`rg`" + ` command is not found, then use alternatives.)
-- **File Operations:** Use specialized tools instead of bash commands when possible, as this provides a better user experience. For file operations, use dedicated tools: ` + "`read_file`" + ` for reading files instead of cat/head/tail, ` + "`edit`" + ` for single-file editing instead of sed/awk, ` + "`apply_patch`" + ` for multi-file edits (2+ files), and ` + "`write_file`" + ` for creating files instead of cat with heredoc or echo redirection. Reserve bash tools exclusively for actual system commands and terminal operations that require shell execution. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.
-- **File Creation:** Do not create new files unless necessary for achieving your goal or explicitly requested. Prefer editing an existing file when possible. This includes markdown files.
-- **Remembering Facts:** Use the ` + "`memory`" + ` tool to remember specific, *user-related* facts or preferences when the user explicitly asks, or when they state a clear, concise piece of information that would help personalize or streamline *your future interactions with them* (e.g., preferred coding style, common project paths they use, personal tool aliases). This tool is for user-specific information that should persist across sessions. Do *not* use it for general project context or information.
-- **Task Management:** Use the ` + "`todos`" + ` tool to track multi-step tasks. Mark tasks as completed as soon as you finish each task. Do not batch up multiple tasks before marking them as completed. Use the todos tool VERY frequently to ensure that you are tracking your tasks and giving the user visibility into your progress. These tools are also EXTREMELY helpful for planning tasks, and for breaking down larger complex tasks into smaller steps.
-- **Sub-Agents:** When available, use sub-agents for complex codebase exploration, code review, or specialized multi-step tasks. Sub-agents run with isolated context and have limited tool access, making them ideal for focused investigations. For simple queries (like finding a specific function), use direct tools (` + "`grep`" + `, ` + "`read_file`" + `) instead. Use sub-agents when the task involves complex refactoring, codebase exploration, or system-wide analysis. Provide clear, specific goals when invoking sub-agents and integrate their results into your main workflow.
+- **Parallelism:** Prefer independent tool calls when gathering information (searching, reading multiple files). If some tool calls depend on previous results, call them sequentially.
+- **Command Execution:** Use the ` + "`shell`" + ` tool for running shell commands. Before executing commands that modify the file system, codebase, or system state, provide a brief explanation of the command's purpose and potential impact. Prefer the dedicated ` + "`grep`" + ` and ` + "`glob`" + ` tools for search instead of shell grep/find when possible.
+- **File Operations:** Use specialized tools instead of bash when possible: ` + "`read_file`" + ` for reading, ` + "`edit`" + ` for surgical search/replace, ` + "`write_file`" + ` for creating files or complete rewrites. Reserve shell for actual system commands. NEVER use bash echo to communicate with the user — output communication in your response text.
+- **File Creation:** Do not create new files unless necessary for achieving your goal or explicitly requested. Prefer editing an existing file when possible.
+- **Task Management:** Use the ` + "`todos`" + ` tool to track multi-step tasks. Mark tasks as completed as soon as you finish each task. Do not batch up multiple tasks before marking them as completed.
+- **Workspace confinement:** All file and shell operations are confined to the working directory. Paths outside the workspace root will be refused.
 
 ## Error Recovery
 
@@ -214,7 +218,7 @@ Example: "Clients are marked as failed in the ` + "`connectToServer`" + ` functi
 
 ## Professional Objectivity
 
-Prioritize technical accuracy and truthfulness over validating the user's beliefs. Focus on facts and problem-solving, providing direct, objective technical info without any unnecessary superlatives, praise, or emotional validation. It is best for the user if you honestly apply the same rigorous standards to all ideas and disagree when necessary, even if it may not be what the user wants to hear. Objective guidance and respectful correction are more valuable than false agreement. Whenever there is uncertainty, it's best to investigate to find the truth first rather than instinctively confirming the user's beliefs.
+Prioritize technical accuracy and truthfulness over validating the user's beliefs. Focus on facts and problem-solving, providing direct, objective technical info without any unnecessary superlatives, praise, or emotional validation.
 
 ## Coding Guidelines
 
@@ -226,7 +230,7 @@ If completing the user's task requires writing or modifying files, your code and
 - Update documentation as necessary.
 - Keep changes consistent with the style of the existing codebase. Changes should be minimal and focused on the task.
 - NEVER add copyright or license headers unless specifically requested.
-- Do not waste tokens by re-reading files after calling ` + "`apply_patch`" + ` on them. The tool call will fail if it didn't work. The same goes for making folders, deleting folders, etc.
+- Do not waste tokens by re-reading files after a successful edit — the tool result already confirms success.
 - Do not add inline comments within code unless explicitly requested.
 - Do not use one-letter variable names unless explicitly requested.`
 }
@@ -260,14 +264,21 @@ Use this information to personalize your responses and maintain consistency.`, m
 }
 
 func getToolGuidelinesSection(tools []llm.Tool) string {
+	names := make(map[string]struct{}, len(tools))
 	var regular []llm.Tool
 	var subagent []llm.Tool
 	for _, t := range tools {
+		names[t.Function.Name] = struct{}{}
 		if strings.HasPrefix(t.Function.Name, "subagent_") {
 			subagent = append(subagent, t)
 		} else {
 			regular = append(regular, t)
 		}
+	}
+
+	has := func(name string) bool {
+		_, ok := names[name]
+		return ok
 	}
 
 	var b strings.Builder
@@ -290,40 +301,64 @@ You have access to the following tools to accomplish your tasks:
 		}
 	}
 
-	b.WriteString(`
-## Best Practices
-
-1. **File Operations**:
-   - Use ` + "`read_file`" + ` before editing to understand current content
-   - Use ` + "`edit`" + ` for surgical changes (search/replace)
-   - Use ` + "`write_file`" + ` for creating new files or complete rewrites
-
-2. **Search and Discovery**:
-   - Use ` + "`grep`" + ` to find code by content
-   - Use ` + "`glob`" + ` to find files by name pattern
-   - Use ` + "`list_dir`" + ` to explore directory structure
-
-3. **Shell Commands**:
-   - Use ` + "`shell`" + ` for running commands, tests, builds
+	b.WriteString("\n## Best Practices\n\n")
+	n := 1
+	if has("read_file") || has("edit") || has("write_file") {
+		fmt.Fprintf(&b, "%d. **File Operations**:\n", n)
+		if has("read_file") {
+			b.WriteString("   - Use `read_file` before editing to understand current content\n")
+		}
+		if has("edit") {
+			b.WriteString("   - Use `edit` for surgical changes (search/replace)\n")
+		}
+		if has("write_file") {
+			b.WriteString("   - Use `write_file` for creating new files or complete rewrites\n")
+		}
+		n++
+	}
+	if has("grep") || has("glob") || has("list_dir") {
+		fmt.Fprintf(&b, "%d. **Search and Discovery**:\n", n)
+		if has("grep") {
+			b.WriteString("   - Use `grep` to find code by content\n")
+		}
+		if has("glob") {
+			b.WriteString("   - Use `glob` to find files by name pattern\n")
+		}
+		if has("list_dir") {
+			b.WriteString("   - Use `list_dir` to explore directory structure\n")
+		}
+		n++
+	}
+	if has("shell") {
+		fmt.Fprintf(&b, `%d. **Shell Commands**:
+   - Use `+"`shell`"+` for running commands, tests, builds
    - Prefer read-only commands when just gathering information
    - Be cautious with commands that modify state
-
-4. **Task Management**:
-   - Use ` + "`todos`" + ` to track multi-step tasks
+`, n)
+		n++
+	}
+	if has("todos") {
+		fmt.Fprintf(&b, `%d. **Task Management**:
+   - Use `+"`todos`"+` to track multi-step tasks
    - Mark tasks as completed as you finish them
-
-5. **Memory**:
-   - Use ` + "`memory`" + ` to store important user preferences
-   - Retrieve stored preferences when relevant`)
+`, n)
+		n++
+	}
+	if has("memory") {
+		fmt.Fprintf(&b, `%d. **Memory**:
+   - Use `+"`memory`"+` to store important user preferences
+   - Retrieve stored preferences when relevant
+`, n)
+		n++
+	}
 
 	if len(subagent) > 0 {
-		b.WriteString(`
-6. **Sub-Agents**:
+		fmt.Fprintf(&b, `%d. **Sub-Agents**:
    - Use sub-agents for complex codebase exploration, code review, or specialized multi-step tasks
    - Sub-agents run with isolated context and have limited tool access
    - Provide clear, specific goals when invoking sub-agents
-   - For simple queries (like finding a specific function), use direct tools (` + "`grep`" + `, ` + "`read_file`" + `) instead
-   - Use sub-agents when the task involves complex refactoring, codebase exploration, or system-wide analysis`)
+   - For simple queries, use direct tools instead
+`, n)
 	}
 
 	return b.String()

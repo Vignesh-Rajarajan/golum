@@ -2,14 +2,14 @@ package ui
 
 import (
 	tea "charm.land/bubbletea/v2"
-	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
+	"github.com/Vignesh-Rajarajan/golum/pkg/harness"
 )
 
-type StreamMsg struct {
-	Event llm.StreamEvent
+type AgentEventMsg struct {
+	Event harness.AgentEvent
 }
 
-type StreamDoneMsg struct{}
+type AgentDoneMsg struct{}
 
 type ErrorMsg struct {
 	Error error
@@ -19,16 +19,16 @@ type InputSubmitMsg struct {
 	Text string
 }
 
-type streamReader struct {
-	events <-chan llm.StreamEvent
+type agentEventReader struct {
+	events <-chan harness.AgentEvent
 }
 
-func (r *streamReader) Read() tea.Cmd {
+func (r *agentEventReader) Read() tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-r.events
 		if !ok {
-			return StreamDoneMsg{}
+			return AgentDoneMsg{}
 		}
-		return StreamMsg{Event: event}
+		return AgentEventMsg{Event: event}
 	}
 }

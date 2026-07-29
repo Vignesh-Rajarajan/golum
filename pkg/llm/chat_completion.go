@@ -2,9 +2,12 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/applog"
@@ -27,36 +30,16 @@ const DefaultMaxRetries = 3
 // The method returns a channel of StreamEvent objects that the caller can iterate over.
 // Events include:
 //   - ContentDelta: Incremental content chunks (streaming only)
+//   - ThinkingDelta: Reasoning chunks (when GOLUM_STREAM_REASONING=1)
 //   - ContentStart: Content generation started
-//   - ContentDone: Content generation completed
-//   - ToolCall: Tool/function call request
+//   - ContentDone: Content generation completed (FinishReason set when known)
+//   - ToolCall: Completed tool/function call (one per call, after accumulation)
 //   - Error: Error occurred
 //
 // Retry Behavior:
 //   - Rate limit errors: Retries with exponential backoff (2^attempt seconds)
 //   - Connection errors: Retries with exponential backoff (2^attempt seconds)
 //   - API errors: No retry, returns error immediately
-//
-// Example usage:
-//
-//	messages := []openai.ChatCompletionMessage{
-//	    {Role: openai.ChatMessageRoleUser, Content: "Hello!"},
-//	}
-//	opts := ChatCompletionOptions{
-//	    Stream:     true,
-//	    MaxRetries: 3,
-//	}
-//	events := client.ChatCompletion(ctx, messages, opts)
-//	for event := range events {
-//	    switch event.Type {
-//	    case EventTypeContentDelta:
-//	        fmt.Print(event.Content)
-//	    case EventTypeContentDone:
-//	        fmt.Println("\nDone!")
-//	    case EventTypeError:
-//	        log.Printf("Error: %v", event.Error)
-//	    }
-//	}
 func (c *Client) ChatCompletion(
 	ctx context.Context,
 	messages []openai.ChatCompletionMessage,
@@ -106,9 +89,15 @@ func (c *Client) ChatCompletion(
 				return
 			}
 
-			// Exponential backoff
+			// Exponential backoff — respect cancellation
 			waitTime := time.Duration(1<<uint(attempt)) * time.Second
-			time.Sleep(waitTime)
+			t := time.NewTimer(waitTime)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
 		}
 	}()
 
@@ -181,12 +170,58 @@ func streamUsageMeta(u *openai.Usage) map[string]string {
 	}
 }
 
-func streamDoneEvent(usage *openai.Usage) StreamEvent {
-	ev := StreamEvent{Type: EventTypeContentDone, Done: true}
+func streamDoneEvent(usage *openai.Usage, finishReason string) StreamEvent {
+	ev := StreamEvent{Type: EventTypeContentDone, Done: true, FinishReason: finishReason}
 	if m := streamUsageMeta(usage); m != nil {
 		ev.Meta = m
 	}
 	return ev
+}
+
+// toolCallBuilder accumulates streamed tool-call fragments keyed by index.
+type toolCallBuilder struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
+func buildToolCall(b *toolCallBuilder) *ToolCall {
+	tc := &ToolCall{
+		ID:           b.id,
+		Name:         b.name,
+		RawArguments: b.args.String(),
+	}
+	s := strings.TrimSpace(tc.RawArguments)
+	if s == "" {
+		tc.Arguments = map[string]interface{}{}
+	} else if err := json.Unmarshal([]byte(s), &tc.Arguments); err != nil {
+		tc.ArgsErr = err
+	}
+	return tc
+}
+
+func sortedBuilderKeys(builders map[int]*toolCallBuilder) []int {
+	keys := make([]int, 0, len(builders))
+	for k := range builders {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func toolCallFromOpenAI(toolCall openai.ToolCall) *ToolCall {
+	tc := &ToolCall{
+		ID:           toolCall.ID,
+		Name:         toolCall.Function.Name,
+		RawArguments: toolCall.Function.Arguments,
+	}
+	s := strings.TrimSpace(tc.RawArguments)
+	if s == "" {
+		tc.Arguments = map[string]interface{}{}
+	} else if err := json.Unmarshal([]byte(s), &tc.Arguments); err != nil {
+		tc.ArgsErr = err
+	}
+	return tc
 }
 
 // executeStreamRequest handles streaming chat completion
@@ -210,18 +245,61 @@ func (c *Client) executeStreamRequest(
 	}
 	defer stream.Close()
 
+	builders := map[int]*toolCallBuilder{}
+	var lastFinishReason string
+	var lastUsage *openai.Usage
+
+	flush := func() {
+		if builders == nil {
+			return
+		}
+		for _, idx := range sortedBuilderKeys(builders) {
+			b := builders[idx]
+			tc := buildToolCall(b)
+			applog.Printf("stream: EventTypeToolCall id=%q name=%q args_len=%d args_err=%v",
+				tc.ID, tc.Name, len(tc.RawArguments), tc.ArgsErr != nil)
+			ch <- StreamEvent{Type: EventTypeToolCall, Tool: tc}
+		}
+		builders = nil
+	}
+
+	accumulateToolCalls := func(toolCalls []openai.ToolCall) {
+		for i, toolCall := range toolCalls {
+			idx := i
+			if toolCall.Index != nil {
+				idx = *toolCall.Index
+			}
+			b, ok := builders[idx]
+			if !ok {
+				b = &toolCallBuilder{}
+				builders[idx] = b
+			}
+			if toolCall.ID != "" {
+				b.id = toolCall.ID
+			}
+			if toolCall.Function.Name != "" {
+				b.name = toolCall.Function.Name
+			}
+			if toolCall.Function.Arguments != "" {
+				b.args.WriteString(toolCall.Function.Arguments)
+			}
+		}
+	}
+
 	first := true
 	for {
 		raw, err := stream.RecvRaw()
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				applog.Printf("stream: recv cancelled")
+				flush()
 				ch <- StreamEvent{Type: EventTypeContentDone, Done: true, Cancelled: true}
 				return nil
 			}
 			if errors.Is(err, io.EOF) || err.Error() == "EOF" {
 				applog.Printf("stream: recv EOF (done=%v)", err)
-				ch <- StreamEvent{Type: EventTypeContentDone, Done: true}
+				flush()
+				ch <- streamDoneEvent(lastUsage, lastFinishReason)
 				return nil
 			}
 			applog.Printf("stream: recv error: %v", err)
@@ -232,16 +310,20 @@ func (c *Client) executeStreamRequest(
 			first = false
 		}
 
-		content, finishReason, usage, toolCalls, hasChoices, err := parseStreamingChunk(raw)
+		content, thinking, finishReason, usage, toolCalls, hasChoices, err := parseStreamingChunk(raw)
 		if err != nil {
 			applog.Printf("stream: chunk json: %v", err)
 			continue
+		}
+		if usage != nil {
+			lastUsage = usage
 		}
 
 		// Usage-only final chunk (OpenAI: choices may be empty when using stream_options include_usage).
 		if !hasChoices {
 			if usage != nil && usage.TotalTokens > 0 {
-				ch <- streamDoneEvent(usage)
+				flush()
+				ch <- streamDoneEvent(usage, lastFinishReason)
 				return nil
 			}
 			continue
@@ -253,20 +335,22 @@ func (c *Client) executeStreamRequest(
 				Content: content,
 			}
 		}
-
-		for _, toolCall := range toolCalls {
+		if thinking != "" {
 			ch <- StreamEvent{
-				Type: EventTypeToolCall,
-				Tool: &ToolCall{
-					ID:   toolCall.ID,
-					Name: toolCall.Function.Name,
-				},
+				Type:    EventTypeThinkingDelta,
+				Content: thinking,
 			}
 		}
 
+		if len(toolCalls) > 0 {
+			accumulateToolCalls(toolCalls)
+		}
+
 		if finishReason != "" {
+			lastFinishReason = finishReason
 			applog.Printf("stream: finish_reason=%q has_usage=%v", finishReason, usage != nil)
-			ch <- streamDoneEvent(usage)
+			flush()
+			ch <- streamDoneEvent(usage, finishReason)
 			return nil
 		}
 	}
@@ -287,9 +371,11 @@ func (c *Client) executeNonStreamRequest(
 		return err
 	}
 
+	finishReason := ""
 	// Process response
 	if len(response.Choices) > 0 {
 		choice := response.Choices[0]
+		finishReason = string(choice.FinishReason)
 
 		// Send the complete content as a single event
 		if choice.Message.Content != "" {
@@ -302,12 +388,12 @@ func (c *Client) executeNonStreamRequest(
 		// Handle tool calls
 		if len(choice.Message.ToolCalls) > 0 {
 			for _, toolCall := range choice.Message.ToolCalls {
+				tc := toolCallFromOpenAI(toolCall)
+				applog.Printf("nonstream: EventTypeToolCall id=%q name=%q args_len=%d args_err=%v",
+					tc.ID, tc.Name, len(tc.RawArguments), tc.ArgsErr != nil)
 				ch <- StreamEvent{
 					Type: EventTypeToolCall,
-					Tool: &ToolCall{
-						ID:   toolCall.ID,
-						Name: toolCall.Function.Name,
-					},
+					Tool: tc,
 				}
 			}
 		}
@@ -316,8 +402,9 @@ func (c *Client) executeNonStreamRequest(
 	// Send usage statistics if available
 	if response.Usage.TotalTokens > 0 {
 		ch <- StreamEvent{
-			Type: EventTypeContentDone,
-			Done: true,
+			Type:         EventTypeContentDone,
+			Done:         true,
+			FinishReason: finishReason,
 			Meta: map[string]string{
 				"prompt_tokens":     fmt.Sprintf("%d", response.Usage.PromptTokens),
 				"completion_tokens": fmt.Sprintf("%d", response.Usage.CompletionTokens),
@@ -325,7 +412,7 @@ func (c *Client) executeNonStreamRequest(
 			},
 		}
 	} else {
-		ch <- StreamEvent{Type: EventTypeContentDone, Done: true}
+		ch <- StreamEvent{Type: EventTypeContentDone, Done: true, FinishReason: finishReason}
 	}
 
 	return nil
