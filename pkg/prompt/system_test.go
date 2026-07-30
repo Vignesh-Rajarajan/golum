@@ -205,3 +205,46 @@ func TestCreateLoopBreakerPrompt(t *testing.T) {
 		t.Fatal("expected loop notice content")
 	}
 }
+
+func TestGetSystemPrompt_RendersDeveloperAndUserInstructions(t *testing.T) {
+	tools := []llm.Tool{{Type: "function", Function: llm.ToolFunction{Name: "read_file", Description: "Read"}}}
+	out := GetSystemPrompt(PromptConfig{
+		CWD:                   "/tmp",
+		DeveloperInstructions: "ALWAYS_RUN_GO_VET",
+		UserInstructions:      "USER_PREFERS_TABS",
+	}, nil, tools)
+
+	if !strings.Contains(out, "ALWAYS_RUN_GO_VET") {
+		t.Fatal("AGENTS.md content must reach the system prompt")
+	}
+	if !strings.Contains(out, "USER_PREFERS_TABS") {
+		t.Fatal("user instructions must reach the system prompt")
+	}
+}
+
+func TestGetSystemPrompt_RendersRememberedMemory(t *testing.T) {
+	tools := []llm.Tool{{Type: "function", Function: llm.ToolFunction{Name: "read_file", Description: "Read"}}}
+	mem := "- **style**: REMEMBERED_FACT"
+	out := GetSystemPrompt(PromptConfig{CWD: "/tmp"}, &mem, tools)
+
+	if !strings.Contains(out, "REMEMBERED_FACT") {
+		t.Fatal("remembered user memory must render in the prompt")
+	}
+	if !strings.Contains(out, "Remembered Context") {
+		t.Fatal("expected the memory section header")
+	}
+}
+
+func TestGetSystemPrompt_MemoryToolGuidanceOnlyWhenRegistered(t *testing.T) {
+	withoutMemory := []llm.Tool{{Type: "function", Function: llm.ToolFunction{Name: "read_file", Description: "Read"}}}
+	if strings.Contains(GetSystemPrompt(PromptConfig{CWD: "/tmp"}, nil, withoutMemory), "`memory`") {
+		t.Fatal("must not describe the memory tool when it is not registered")
+	}
+
+	withMemory := append(withoutMemory,
+		llm.Tool{Type: "function", Function: llm.ToolFunction{Name: "memory", Description: "Remember"}})
+	out := GetSystemPrompt(PromptConfig{CWD: "/tmp"}, nil, withMemory)
+	if !strings.Contains(out, "`memory`") {
+		t.Fatal("memory guidance should appear once the tool is registered")
+	}
+}

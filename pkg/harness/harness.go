@@ -3,7 +3,6 @@ package harness
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
@@ -12,9 +11,9 @@ import (
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness/session"
 	"github.com/Vignesh-Rajarajan/golum/pkg/hooks"
 	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
+	"github.com/Vignesh-Rajarajan/golum/pkg/memory"
 	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
 	"github.com/Vignesh-Rajarajan/golum/pkg/tool"
-	"github.com/sashabaranov/go-openai"
 )
 
 // Phase is the harness lifecycle state.
@@ -38,6 +37,9 @@ type AgentHarness struct {
 	approvals     ApprovalBroker
 	todos         *tool.TodoStore
 	hooks         *hooks.HooksManager
+	compactor     *Compactor
+	memory        *memory.Store
+	episodic      *EpisodicTracker
 	cfg           LoopConfig
 	promptCfg     prompt.PromptConfig
 
@@ -56,6 +58,7 @@ type HarnessConfig struct {
 	Session   session.Session
 	Approvals ApprovalBroker
 	Hooks     *hooks.HooksManager
+	Memory    *memory.Store
 	Loop      LoopConfig
 	PromptCfg prompt.PromptConfig
 }
@@ -107,6 +110,9 @@ func NewAgentHarness(hc HarnessConfig) (*AgentHarness, error) {
 		approvals: hc.Approvals,
 		todos:     hc.Todos,
 		hooks:     hc.Hooks,
+		compactor: NewCompactor(hc.Client),
+		memory:    hc.Memory,
+		episodic:  NewEpisodicTracker(),
 		cfg:       loop,
 		promptCfg: hc.PromptCfg,
 		phase:     PhaseIdle,
@@ -115,6 +121,18 @@ func NewAgentHarness(hc HarnessConfig) (*AgentHarness, error) {
 
 // Session returns the active session.
 func (h *AgentHarness) Session() session.Session { return h.session }
+
+// SetSession swaps in a different session (resume or fork). Refused while a
+// turn is in flight, since the loop holds a reference to the current one.
+func (h *AgentHarness) SetSession(s session.Session) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.phase != PhaseIdle {
+		return fmt.Errorf("harness busy (%s)", h.phase)
+	}
+	h.session = s
+	return nil
+}
 
 // Registry returns the tool registry.
 func (h *AgentHarness) Registry() *tool.Registry { return h.registry }
@@ -188,7 +206,17 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string) (<-chan AgentEve
 			}
 		}
 
-		_ = RunAgentLoop(turnCtx, h.client, h.session, h.registry, h.env, approvals, h.todos, h.cfg, emit)
+		_ = RunAgentLoop(turnCtx, LoopDeps{
+			Client:    h.client,
+			Session:   h.session,
+			Registry:  h.registry,
+			Env:       h.env,
+			Approvals: approvals,
+			Todos:     h.todos,
+			Compactor: h.compactor,
+			Memory:    h.memory,
+			Episodic:  h.episodic,
+		}, h.cfg, emit)
 	}()
 	return ch, nil
 }
@@ -202,58 +230,39 @@ func (h *AgentHarness) Abort() {
 	}
 }
 
-// Compact compresses context using the compression prompt when needed or forced.
-func (h *AgentHarness) Compact(ctx context.Context) error {
+// Compact runs tiered compaction now, regardless of threshold or cooldown.
+// This is the manual path; the loop compacts automatically via the Compactor.
+func (h *AgentHarness) Compact(ctx context.Context, emit func(AgentEvent)) (CompactionResult, error) {
 	h.mu.Lock()
 	if h.phase != PhaseIdle {
+		phase := h.phase
 		h.mu.Unlock()
-		return fmt.Errorf("harness busy (%s)", h.phase)
+		return CompactionResult{}, fmt.Errorf("harness busy (%s)", phase)
 	}
 	h.phase = PhaseCompacting
 	h.mu.Unlock()
 	defer h.setPhase(PhaseIdle)
 
-	cm := h.session.ContextManager()
-	if cm == nil {
-		return fmt.Errorf("no context manager")
-	}
-	cm.PruneToolOutputs()
-
-	messages := cm.ChatCompletionMessages()
-	messages = append(messages, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: prompt.GetCompressionPrompt(),
-	})
-
-	opts := llm.ChatCompletionOptions{
-		Stream:     false,
-		MaxRetries: 2,
-		Timeout:    h.cfg.StreamTimeout,
-	}
-	events := h.client.ChatCompletion(ctx, messages, opts)
-	var summary strings.Builder
-	for ev := range events {
-		if ev.Type == llm.EventTypeContentDelta {
-			summary.WriteString(ev.Content)
-		}
-		if ev.Type == llm.EventTypeError {
-			return ev.Error
-		}
-	}
-	s := summary.String()
-	if strings.TrimSpace(s) == "" {
-		return fmt.Errorf("empty compression summary")
-	}
-	return h.session.AppendCompaction(s)
+	return h.compactor.Compact(ctx, h.session, emit)
 }
 
-// NeedsCompression reports whether the session context is near the limit.
+// NeedsCompression reports whether the session context is near the limit,
+// using the larger of reported usage and the local estimate.
 func (h *AgentHarness) NeedsCompression() bool {
 	cm := h.session.ContextManager()
 	if cm == nil {
 		return false
 	}
-	return cm.NeedsCompression()
+	return cm.ShouldCompact()
+}
+
+// ContextUsageRatio reports how full the context window is (0..1).
+func (h *AgentHarness) ContextUsageRatio() float64 {
+	cm := h.session.ContextManager()
+	if cm == nil {
+		return 0
+	}
+	return cm.ContextUsageRatio()
 }
 
 // NewSession replaces the in-memory session with a fresh one (keeps tools/env).

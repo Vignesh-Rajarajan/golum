@@ -27,6 +27,9 @@ type ContextManager struct {
 	latestUsage TokenUsage
 	// TotalUsage accumulates usage across requests (Python: total_usage).
 	TotalUsage TokenUsage
+
+	// systemTokens caches the frozen system prompt's token count.
+	systemTokens int
 }
 
 // NewContextManager builds a manager with a frozen system prompt from prompt.GetSystemPrompt.

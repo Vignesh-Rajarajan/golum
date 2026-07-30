@@ -9,10 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Vignesh-Rajarajan/golum/pkg/applog"
 	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness/session"
 	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
+	"github.com/Vignesh-Rajarajan/golum/pkg/memory"
 	"github.com/Vignesh-Rajarajan/golum/pkg/observability"
 	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
 	"github.com/Vignesh-Rajarajan/golum/pkg/sanitize"
@@ -31,6 +33,8 @@ const (
 	EventToolCallAwaitingApproval AgentEventType = "tool_call_awaiting_approval"
 	EventToolCallResult           AgentEventType = "tool_call_result"
 	EventTodosChanged             AgentEventType = "todos_changed"
+	EventCompactionStart          AgentEventType = "compaction_start"
+	EventCompactionDone           AgentEventType = "compaction_done"
 	EventError                    AgentEventType = "error"
 	EventTurnDone                 AgentEventType = "turn_done"
 )
@@ -42,6 +46,7 @@ type AgentEvent struct {
 	ToolCall   *llm.ToolCall
 	ToolResult *tool.Result
 	Todos      []tool.TodoItem
+	Compaction *CompactionResult
 	Meta       map[string]string
 	Err        error
 	Cancelled  bool
@@ -83,15 +88,26 @@ type AutoApprove struct{}
 
 func (AutoApprove) Request(context.Context, llm.ToolCall) (bool, error) { return true, nil }
 
+// LoopDeps bundles the collaborators RunAgentLoop needs. Grouping them keeps
+// the loop callable (and testable) without a ten-argument signature.
+type LoopDeps struct {
+	Client    *llm.Client
+	Session   session.Session
+	Registry  *tool.Registry
+	Env       execenv.ExecutionEnv
+	Approvals ApprovalBroker
+	Todos     *tool.TodoStore
+	Compactor *Compactor
+	// Memory, when set, receives an episodic digest at the end of each turn.
+	Memory *memory.Store
+	// Episodic accumulates file changes and failures within a turn.
+	Episodic *EpisodicTracker
+}
+
 // RunAgentLoop drives model ↔ tool rounds until the turn completes or a guardrail trips.
 func RunAgentLoop(
 	ctx context.Context,
-	client *llm.Client,
-	sess session.Session,
-	registry *tool.Registry,
-	env execenv.ExecutionEnv,
-	approvals ApprovalBroker,
-	todos *tool.TodoStore,
+	deps LoopDeps,
 	cfg LoopConfig,
 	emit func(AgentEvent),
 ) error {
@@ -110,8 +126,8 @@ func RunAgentLoop(
 	if cfg.ToolExecTimeout <= 0 {
 		cfg.ToolExecTimeout = DefaultLoopConfig().ToolExecTimeout
 	}
-	if approvals == nil {
-		approvals = AutoApprove{}
+	if deps.Approvals == nil {
+		deps.Approvals = AutoApprove{}
 	}
 	if emit == nil {
 		emit = func(AgentEvent) {}
@@ -123,26 +139,26 @@ func RunAgentLoop(
 	}
 
 	return observability.Wrap(observability.DefaultSink, "RunAgentLoop", func() error {
-		return runAgentLoopInner(ctx, client, sess, registry, env, approvals, todos, cfg, emit, deadline)
+		return runAgentLoopInner(ctx, deps, cfg, emit, deadline)
 	})
 }
 
 func runAgentLoopInner(
 	ctx context.Context,
-	client *llm.Client,
-	sess session.Session,
-	registry *tool.Registry,
-	env execenv.ExecutionEnv,
-	approvals ApprovalBroker,
-	todos *tool.TodoStore,
+	deps LoopDeps,
 	cfg LoopConfig,
 	emit func(AgentEvent),
 	deadline time.Time,
 ) error {
-	llmTools := registry.AsLLMTools()
+	client := deps.Client
+	sess := deps.Session
+	todos := deps.Todos
+
+	llmTools := deps.Registry.AsLLMTools()
 	var recentHashes []string
 	toolCallsThisTurn := 0
 	consecutiveErrors := 0
+	overflowRetried := false
 
 	for invocation := 0; invocation < cfg.MaxModelInvocations; invocation++ {
 		if err := ctx.Err(); err != nil {
@@ -153,6 +169,15 @@ func runAgentLoopInner(
 			emit(AgentEvent{Type: EventError, Err: fmt.Errorf("wall-clock limit exceeded (%s)", cfg.MaxWallClock)})
 			emit(AgentEvent{Type: EventTurnDone})
 			return fmt.Errorf("wall-clock limit exceeded")
+		}
+
+		// Compact before building the request, not after a failure: the estimate
+		// is available now, whereas reported usage only arrives with a response.
+		if deps.Compactor != nil {
+			if _, cErr := deps.Compactor.MaybeCompact(ctx, sess, emit); cErr != nil {
+				// A failed compaction is not fatal — the request may still fit.
+				applog.Printf("loop: auto-compaction failed: %v", cErr)
+			}
 		}
 
 		messages, err := sess.BuildContext()
@@ -173,6 +198,7 @@ func runAgentLoopInner(
 		var content strings.Builder
 		var toolCalls []*llm.ToolCall
 		var usageMeta map[string]string
+		var streamErr error
 		cancelled := false
 
 		for ev := range events {
@@ -191,10 +217,23 @@ func runAgentLoopInner(
 				cancelled = ev.Cancelled
 				emit(AgentEvent{Type: EventContentDone, Meta: ev.Meta, Cancelled: ev.Cancelled})
 			case llm.EventTypeError:
-				emit(AgentEvent{Type: EventError, Err: ev.Error})
-				emit(AgentEvent{Type: EventTurnDone})
-				return ev.Error
+				streamErr = ev.Error
 			}
+		}
+
+		// A context-overflow rejection is recoverable exactly once: compact and
+		// retry the same turn rather than losing the user's request.
+		if streamErr != nil {
+			if llm.IsContextOverflowError(streamErr) && !overflowRetried && deps.Compactor != nil {
+				overflowRetried = true
+				applog.Printf("loop: context overflow; compacting and retrying once")
+				if _, cErr := deps.Compactor.Compact(ctx, sess, emit); cErr == nil {
+					continue
+				}
+			}
+			emit(AgentEvent{Type: EventError, Err: streamErr})
+			emit(AgentEvent{Type: EventTurnDone})
+			return streamErr
 		}
 
 		if cancelled {
@@ -228,6 +267,7 @@ func runAgentLoopInner(
 		}
 
 		if len(toolCalls) == 0 {
+			recordEpisode(ctx, deps)
 			emit(AgentEvent{Type: EventTurnDone})
 			return nil
 		}
@@ -256,12 +296,13 @@ func runAgentLoopInner(
 
 			emit(AgentEvent{Type: EventToolCallStart, ToolCall: tc})
 
-			resultContent, result, todosChanged := dispatchToolCall(ctx, tc, registry, env, approvals, sess, todos, cfg, emit)
+			resultContent, result, todosChanged := dispatchToolCall(ctx, tc, deps, cfg, emit)
 			if _, err := sess.AppendToolResult(tc.ID, resultContent); err != nil {
 				emit(AgentEvent{Type: EventError, Err: err})
 				emit(AgentEvent{Type: EventTurnDone})
 				return err
 			}
+			deps.Episodic.Observe(tc, result.IsError, resultContent)
 			emit(AgentEvent{Type: EventToolCallResult, ToolCall: tc, ToolResult: &result})
 			if todosChanged && todos != nil {
 				emit(AgentEvent{Type: EventTodosChanged, Todos: todos.List()})
@@ -300,14 +341,18 @@ func runAgentLoopInner(
 func dispatchToolCall(
 	ctx context.Context,
 	tc *llm.ToolCall,
-	registry *tool.Registry,
-	env execenv.ExecutionEnv,
-	approvals ApprovalBroker,
-	sess session.Session,
-	todos *tool.TodoStore,
+	deps LoopDeps,
 	cfg LoopConfig,
 	emit func(AgentEvent),
 ) (content string, result tool.Result, todosChanged bool) {
+	registry := deps.Registry
+	env := deps.Env
+	approvals := deps.Approvals
+	sess := deps.Session
+	todos := deps.Todos
+	if approvals == nil {
+		approvals = AutoApprove{}
+	}
 	if tc.ArgsErr != nil {
 		msg := fmt.Sprintf("Invalid tool arguments: %v", tc.ArgsErr)
 		return msg, tool.Result{Content: msg, IsError: true, Display: "invalid args"}, false

@@ -469,6 +469,22 @@ func (c *Client) shouldRetry(
 	return false
 }
 
+// IsContextOverflowError reports whether err is the provider rejecting a
+// request for exceeding the model's context window. This is recoverable by
+// compacting and retrying, unlike other 400-class errors.
+func IsContextOverflowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return contains(errStr, "context_length_exceeded") ||
+		contains(errStr, "maximum context length") ||
+		contains(errStr, "context length") ||
+		contains(errStr, "reduce the length of the messages") ||
+		contains(errStr, "too many tokens") ||
+		contains(errStr, "prompt is too long")
+}
+
 // isRateLimitError checks if the error is a rate limit error
 func isRateLimitError(err error) bool {
 	// Check for common rate limit error patterns

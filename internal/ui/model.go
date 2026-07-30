@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textinput"
@@ -17,6 +18,7 @@ import (
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness/session"
+	"github.com/Vignesh-Rajarajan/golum/pkg/memory"
 	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
 	"github.com/Vignesh-Rajarajan/golum/pkg/skill"
 	"github.com/Vignesh-Rajarajan/golum/pkg/tool"
@@ -26,6 +28,10 @@ import (
 type Model struct {
 	styles                styles.Styles
 	cfg                   *config.Config
+	promptCfg             prompt.PromptConfig
+	store                 *session.SQLiteStore
+	memory                *memory.Store
+	active                *sessionRef
 	harness               *harness.AgentHarness
 	approvals             *approvalBroker
 	messages              []Message
@@ -36,6 +42,7 @@ type Model struct {
 	streaming             bool
 	awaitingApproval      bool
 	approvalSummary       string
+	compacting            bool
 	thinkingExpanded      bool
 	ready                 bool
 	width                 int
@@ -52,6 +59,7 @@ type Model struct {
 	selectableLines       []selectableLine
 	copyStatus            string
 	todosPanel            string
+	picker                pickerState
 }
 
 type selectionPos struct {
@@ -76,7 +84,14 @@ type selectableLine struct {
 	Kind  selectableLineKind
 }
 
-func NewModel(cfg *config.Config) Model {
+// Options configures the initial model.
+type Options struct {
+	// ResumeSessionID, when set, reopens that saved session instead of
+	// starting a new one.
+	ResumeSessionID string
+}
+
+func NewModel(cfg *config.Config, opts Options) Model {
 	s := styles.DefaultStyles()
 
 	ti := textinput.New()
@@ -109,21 +124,46 @@ func NewModel(cfg *config.Config) Model {
 	}
 	reg, todos := tool.DefaultRegistry(nil)
 
+	// Procedural memory: project conventions the prompt has always claimed to
+	// follow (AGENTS.md) plus cross-project user instructions.
 	promptCfg := prompt.PromptConfig{CWD: cwd}
 	if skills, err := skill.LoadSkills(context.Background(), env); err == nil && len(skills) > 0 {
 		promptCfg.SkillsSection = skill.FormatSkillsSection(skills)
 	}
+	if dev, err := memory.LoadProjectInstructions(cwd); err == nil && dev != "" {
+		promptCfg.DeveloperInstructions = dev
+	}
+	if usr, err := memory.LoadUserInstructions(); err == nil && usr != "" {
+		promptCfg.UserInstructions = usr
+	}
 
 	broker := newApprovalBroker()
+	active := &sessionRef{}
 
-	var sess session.Session
-	if dir, err := session.DefaultSessionsDir(); err == nil {
-		if repo, err := session.NewFileSessionRepo(dir, cfg, promptCfg, reg.AsLLMTools()); err == nil {
-			if created, err := repo.Create(context.Background()); err == nil {
-				sess = created
-			}
+	// Open the database before creating the session: the memory tool has to be
+	// registered while the tool list is still being assembled, because
+	// NewContextManager freezes that list into the system prompt.
+	store := openSessionDB(cfg, promptCfg)
+	var memStore *memory.Store
+	if store != nil {
+		memStore = memory.NewStore(store.DB())
+		tool.RegisterMemory(reg, memStore, active.id)
+
+		// Remembered user facts populate the system prompt's memory section,
+		// which until now had no source and was therefore never rendered.
+		if recs, err := memStore.ListScoped(context.Background(),
+			memory.TierProcedural, memory.ScopeUser, 50); err == nil {
+			store.SetUserMemory(memory.FormatForPrompt(recs))
 		}
 	}
+	// Set the tool list only once the registry is final — the system prompt's
+	// tool guidance is derived from it.
+	if store != nil {
+		store.SetTools(reg.AsLLMTools())
+	}
+
+	sess := startSession(store, opts.ResumeSessionID)
+	active.set(sess)
 
 	h, err := harness.NewAgentHarness(harness.HarnessConfig{
 		Config:    cfg,
@@ -132,6 +172,7 @@ func NewModel(cfg *config.Config) Model {
 		Todos:     todos,
 		Session:   sess,
 		Approvals: broker,
+		Memory:    memStore,
 		PromptCfg: promptCfg,
 	})
 	if err != nil {
@@ -141,9 +182,13 @@ func NewModel(cfg *config.Config) Model {
 	m := Model{
 		styles:    s,
 		cfg:       cfg,
+		promptCfg: promptCfg,
+		store:     store,
+		memory:    memStore,
+		active:    active,
 		harness:   h,
 		approvals: broker,
-		messages:  make([]Message, 0),
+		messages:  transcriptFromSession(sess),
 		input:     ti,
 		spinner:   sp,
 		viewport:  vp,
@@ -152,10 +197,107 @@ func NewModel(cfg *config.Config) Model {
 	return m
 }
 
+// sessionRef is a mutable handle to the current session, so tools registered
+// before the session exists (and kept across resume/fork) always report the
+// session that is actually active.
+type sessionRef struct {
+	mu sync.Mutex
+	s  session.Session
+}
+
+func (r *sessionRef) set(s session.Session) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.s = s
+}
+
+func (r *sessionRef) id() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.s == nil {
+		return ""
+	}
+	return r.s.ID()
+}
+
+// openSessionDB opens the SQLite database and migrates any legacy JSONL
+// sessions. A nil return is tolerated: the harness falls back to an in-memory
+// session so the TUI still runs without persistence.
+func openSessionDB(cfg *config.Config, promptCfg prompt.PromptConfig) *session.SQLiteStore {
+	path, err := session.DefaultDBPath()
+	if err != nil {
+		applog.Printf("ui: session db path: %v", err)
+		return nil
+	}
+	store, err := session.OpenSQLiteStore(path, cfg, promptCfg, nil)
+	if err != nil {
+		applog.Printf("ui: open session db: %v", err)
+		return nil
+	}
+	if dir, err := session.DefaultSessionsDir(); err == nil {
+		if n, err := session.MigrateJSONL(context.Background(), store, dir); err != nil {
+			applog.Printf("ui: migrate jsonl sessions: %v", err)
+		} else if n > 0 {
+			applog.Printf("ui: migrated %d legacy jsonl session(s) into sqlite", n)
+		}
+	}
+	return store
+}
+
+// startSession resumes resumeID when given, otherwise creates a new session.
+func startSession(store *session.SQLiteStore, resumeID string) session.Session {
+	if store == nil {
+		return nil
+	}
+	if resumeID != "" {
+		sess, err := store.Open(context.Background(), resumeID)
+		if err == nil {
+			applog.Printf("ui: resumed session %s", resumeID)
+			return sess
+		}
+		// Fall through to a new session rather than refusing to start.
+		applog.Printf("ui: resume %s failed: %v", resumeID, err)
+	}
+	sess, err := store.Create(context.Background())
+	if err != nil {
+		applog.Printf("ui: create session: %v", err)
+		return nil
+	}
+	return sess
+}
+
+// transcriptFromSession rebuilds the visible transcript for a resumed session
+// so the user sees their history, not an empty screen with hidden context.
+func transcriptFromSession(sess session.Session) []Message {
+	if sess == nil {
+		return nil
+	}
+	var out []Message
+	for _, e := range sess.ContextEntries() {
+		switch e.Kind {
+		case session.EntryUserMessage:
+			out = append(out, Message{Role: RoleUser, Content: e.Content})
+		case session.EntryAssistantMessage:
+			if strings.TrimSpace(e.Content) != "" {
+				out = append(out, Message{Role: RoleAssistant, Content: e.Content})
+			}
+		case session.EntryToolResult:
+			out = append(out, Message{Role: RoleToolResult, Content: firstLine(e.Content)})
+		case session.EntryCompaction:
+			out = append(out, Message{
+				Role:    RoleSystem,
+				Content: "— earlier turns compacted —",
+			})
+		}
+	}
+	return out
+}
+
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.spinner.Tick,
 		m.input.Focus(),
+		m.autoIndexCmd(),
 	)
 }
 
@@ -185,8 +327,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetHeight(viewportHeight)
 		m.syncViewportContent()
 
+	case tea.MouseWheelMsg:
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+
 	case tea.KeyPressMsg:
 		key := msg.Key()
+
+		// Session browser owns all input while open.
+		if cmd, handled := m.handlePickerKey(key); handled {
+			m.syncViewportContent()
+			if cmd != nil {
+				return m, cmd
+			}
+			return m, nil
+		}
 
 		// Approval gate — y/n only while awaiting approval
 		if m.awaitingApproval {
@@ -214,7 +370,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		if key.String() == "t" && !m.scrollMode && !m.streaming {
+		if key.String() == "t" && m.scrollMode && !m.streaming {
 			m.thinkingExpanded = !m.thinkingExpanded
 			for i := range m.messages {
 				if m.messages[i].Role == RoleThinking {
@@ -306,9 +462,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.messages = nil
 					m.todosPanel = ""
 					if m.harness != nil {
-						cwd, _ := os.Getwd()
-						promptCfg := prompt.PromptConfig{CWD: cwd}
-						m.startNewSession(promptCfg)
+						m.startNewSession()
 					}
 					m.copyStatus = ""
 					m.syncViewportContent()
@@ -333,6 +487,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case InputSubmitMsg:
+		if cmd, handled := m.handleSlashCommand(msg.Text); handled {
+			m.syncViewportContent()
+			m.viewport.GotoBottom()
+			return m, cmd
+		}
 		m.messages = append(m.messages, Message{
 			Role:    RoleUser,
 			Content: msg.Text,
@@ -341,6 +500,72 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncViewportContent()
 		m.viewport.GotoBottom()
 		return m, m.startAgent(msg.Text)
+
+	case SessionsLoadedMsg:
+		m.picker.loading = false
+		m.picker.sessions = msg.Sessions
+		m.picker.err = msg.Err
+		m.picker.cursor = 0
+		m.syncViewportContent()
+
+	case SessionOpenedMsg:
+		if msg.Err != nil {
+			m.picker.err = msg.Err
+			m.picker.status = ""
+			m.syncViewportContent()
+			return m, nil
+		}
+		m.adoptSession(msg.Session)
+		cmds = append(cmds, m.closePicker())
+		m.syncViewportContent()
+		m.viewport.GotoBottom()
+		return m, tea.Batch(cmds...)
+
+	case ReindexDoneMsg:
+		if msg.Err != nil {
+			m.messages = append(m.messages, Message{
+				Role:    RoleError,
+				Content: "Indexing failed: " + msg.Err.Error(),
+			})
+		} else {
+			m.messages = append(m.messages, Message{
+				Role:    RoleSystem,
+				Content: fmt.Sprintf("Indexed %d entries of project structure.", msg.Count),
+			})
+		}
+		m.syncViewportContent()
+		m.viewport.GotoBottom()
+
+	case MemoryReportMsg:
+		if msg.Err != nil {
+			m.messages = append(m.messages, Message{
+				Role:    RoleError,
+				Content: "Memory lookup failed: " + msg.Err.Error(),
+			})
+		} else {
+			m.messages = append(m.messages, Message{Role: RoleSystem, Content: msg.Report})
+		}
+		m.syncViewportContent()
+		m.viewport.GotoBottom()
+
+	case CompactDoneMsg:
+		m.streaming = false
+		if msg.Err != nil {
+			m.messages = append(m.messages, Message{
+				Role:    RoleError,
+				Content: "Compaction failed: " + msg.Err.Error(),
+			})
+		} else {
+			m.messages = append(m.messages, Message{
+				Role:    RoleSystem,
+				Content: msg.Summary,
+			})
+		}
+		m.syncViewportContent()
+		m.viewport.GotoBottom()
+		if !m.input.Focused() {
+			cmds = append(cmds, m.input.Focus())
+		}
 
 	case AgentEventMsg:
 		m.handleAgentEvent(msg.Event)
@@ -366,11 +591,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.input.Focus())
 		}
 		m.skipScrollAfterStream = false
-
-		// Auto-compact hint path: prune if needed
-		if m.harness != nil && m.harness.NeedsCompression() {
-			applog.Printf("ui: context near limit — consider compaction")
-		}
+		m.compacting = false
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -411,8 +632,13 @@ func (m Model) View() tea.View {
 	b.WriteString("\n")
 
 	var statusText string
-	if m.awaitingApproval {
+	if m.picker.active {
+		statusText = m.styles.Chat.Footer.Render(
+			"Sessions · j/k: move | Enter: resume | f: fork | d: delete | Esc: back")
+	} else if m.awaitingApproval {
 		statusText = m.styles.Chat.Footer.Render("Approve tool? [y]es / [n]o · Esc cancels turn · " + m.approvalSummary)
+	} else if m.compacting {
+		statusText = m.styles.Chat.Thinking.Render("Compacting context…")
 	} else if m.streaming {
 		statusText = m.styles.Chat.Thinking.Render("Working… · Esc cancels")
 	} else if m.scrollMode {
@@ -421,7 +647,7 @@ func (m Model) View() tea.View {
 			statusText = m.styles.Chat.Footer.Render(m.copyStatus + " | v: select | y: copy | Ctrl+A: all | i/Esc: type")
 		}
 	} else {
-		line := "Enter to send · Esc: scroll/copy · Ctrl+L: new session · Ctrl+C quit"
+		line := "Enter to send · /compact · Esc: scroll/copy · Ctrl+L: new session · Ctrl+C quit"
 		if hint := m.sessionFooterHint(); hint != "" {
 			line = hint + " · " + line
 		}
@@ -439,6 +665,7 @@ func (m Model) View() tea.View {
 	v := tea.NewView(b.String())
 	v.BackgroundColor = m.styles.BgBase
 	v.AltScreen = true
+	v.MouseMode = tea.MouseModeAllMotion
 
 	if m.input.Focused() {
 		cursor := m.input.Cursor()
@@ -458,6 +685,9 @@ func countLines(s string) int {
 }
 
 func (m *Model) renderMessagesView() string {
+	if m.picker.active {
+		return m.renderPicker()
+	}
 	if m.scrollMode {
 		return m.renderSelectableMessagesView()
 	}
@@ -1028,6 +1258,23 @@ func (m *Model) handleAgentEvent(ev harness.AgentEvent) {
 		m.viewport.GotoBottom()
 	case harness.EventTodosChanged:
 		m.todosPanel = tool.FormatTodosForDisplay(ev.Todos)
+	case harness.EventCompactionStart:
+		m.compacting = true
+	case harness.EventCompactionDone:
+		m.compacting = false
+		if ev.Err != nil {
+			m.messages = append(m.messages, Message{
+				Role:    RoleError,
+				Content: "Compaction failed: " + ev.Err.Error(),
+			})
+		} else if ev.Compaction != nil && ev.Compaction.Tier != harness.TierNone {
+			m.messages = append(m.messages, Message{
+				Role: RoleSystem,
+				Content: fmt.Sprintf("Context compacted (%s): %d → %d tokens.",
+					ev.Compaction.Tier, ev.Compaction.BeforeTokens, ev.Compaction.AfterTokens),
+			})
+		}
+		m.viewport.GotoBottom()
 	case harness.EventError:
 		applog.Printf("agent error: %v", ev.Err)
 		m.streaming = false
@@ -1048,17 +1295,20 @@ func (m *Model) handleAgentEvent(ev harness.AgentEvent) {
 	}
 }
 
-func (m *Model) startNewSession(promptCfg prompt.PromptConfig) {
+// startNewSession swaps in a fresh session, reusing the prompt config captured
+// at startup so the skills section survives (rebuilding it from scratch here
+// would silently drop project skills from every session after the first).
+func (m *Model) startNewSession() {
 	todos := tool.NewTodoStore()
 	reg := m.harness.Registry()
 	reg.Register(tool.NewTodosTool(todos))
 
 	var sess session.Session
-	if dir, err := session.DefaultSessionsDir(); err == nil {
-		if repo, err := session.NewFileSessionRepo(dir, m.cfg, promptCfg, reg.AsLLMTools()); err == nil {
-			if created, err := repo.Create(context.Background()); err == nil {
-				sess = created
-			}
+	if m.store != nil {
+		if created, err := m.store.Create(context.Background()); err == nil {
+			sess = created
+		} else {
+			applog.Printf("ui: new session: %v", err)
 		}
 	}
 	h, err := harness.NewAgentHarness(harness.HarnessConfig{
@@ -1068,10 +1318,10 @@ func (m *Model) startNewSession(promptCfg prompt.PromptConfig) {
 		Todos:     todos,
 		Session:   sess,
 		Approvals: m.approvals,
-		PromptCfg: promptCfg,
+		PromptCfg: m.promptCfg,
 	})
 	if err != nil {
-		m.harness.NewSession(m.cfg, promptCfg)
+		m.harness.NewSession(m.cfg, m.promptCfg)
 		return
 	}
 	m.harness = h
@@ -1098,11 +1348,14 @@ func (m Model) sessionFooterHint() string {
 	if tu.TotalTokens > 0 {
 		fmt.Fprintf(&b, "session Σ %d tok", tu.TotalTokens)
 	}
-	if cm.NeedsCompression() {
+	if ratio := cm.ContextUsageRatio(); ratio > 0 {
 		if b.Len() > 0 {
 			b.WriteString(" · ")
 		}
-		b.WriteString("last response >80% context — summarize or start fresh")
+		fmt.Fprintf(&b, "ctx %.0f%%", ratio*100)
+		if cm.ShouldCompact() {
+			b.WriteString(" (compacting soon)")
+		}
 	}
 	if m.todosPanel != "" {
 		if b.Len() > 0 {

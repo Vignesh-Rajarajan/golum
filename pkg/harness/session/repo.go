@@ -20,10 +20,12 @@ import (
 
 // SessionMeta is lightweight metadata for listing sessions.
 type SessionMeta struct {
-	ID        string    `json:"id"`
-	Label     string    `json:"label,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID         string    `json:"id"`
+	Label      string    `json:"label,omitempty"`
+	CWD        string    `json:"cwd,omitempty"`
+	EntryCount int       `json:"entry_count,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // SessionRepo creates/opens/lists durable sessions under ~/.golum/sessions.
@@ -69,6 +71,14 @@ func (s *JsonlSession) AppendToolResult(toolCallID, content string) (Entry, erro
 
 func (s *JsonlSession) AppendSystemNotice(content string) (Entry, error) {
 	e, err := s.InMemorySession.AppendSystemNotice(content)
+	if err != nil {
+		return e, err
+	}
+	return e, s.persist(e)
+}
+
+func (s *JsonlSession) AppendCompactionAt(summary, cutEntryID string) (Entry, error) {
+	e, err := s.InMemorySession.AppendCompactionAt(summary, cutEntryID)
 	if err != nil {
 		return e, err
 	}
@@ -194,9 +204,16 @@ func (r *FileSessionRepo) Open(ctx context.Context, id string) (Session, error) 
 				}
 			}
 		}
-		_ = js.InMemorySession.ReplayEntry(e)
+		js.InMemorySession.LoadEntry(e)
 	}
-	return js, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	// Derive rather than replay linearly: see InMemorySession.LoadEntry.
+	if err := js.InMemorySession.RebuildContext(); err != nil {
+		return nil, err
+	}
+	return js, nil
 }
 
 func (r *FileSessionRepo) List(ctx context.Context) ([]SessionMeta, error) {

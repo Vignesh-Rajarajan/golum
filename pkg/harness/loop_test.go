@@ -60,6 +60,18 @@ func testSession(t *testing.T, root string) (session.Session, *tool.Registry, ex
 	return sess, reg, env, todos
 }
 
+// testDeps assembles LoopDeps for the dispatch-level tests.
+func testDeps(sess session.Session, reg *tool.Registry, env execenv.ExecutionEnv,
+	approvals ApprovalBroker, todos *tool.TodoStore) LoopDeps {
+	return LoopDeps{
+		Session:   sess,
+		Registry:  reg,
+		Env:       env,
+		Approvals: approvals,
+		Todos:     todos,
+	}
+}
+
 func TestMissingToolResult_ApprovalDenied(t *testing.T) {
 	root := t.TempDir()
 	sess, reg, env, todos := testSession(t, root)
@@ -72,7 +84,7 @@ func TestMissingToolResult_ApprovalDenied(t *testing.T) {
 	}
 	_, _ = sess.AppendAssistantMessage("", []openai.ToolCall{tc.ToOpenAI()})
 
-	content, result, _ := dispatchToolCall(context.Background(), tc, reg, env, denyBroker{}, sess, todos, DefaultLoopConfig(), func(AgentEvent) {})
+	content, result, _ := dispatchToolCall(context.Background(), tc, testDeps(sess, reg, env, denyBroker{}, todos), DefaultLoopConfig(), func(AgentEvent) {})
 	if !result.IsError || !strings.Contains(content, "rejected") {
 		t.Fatalf("expected rejection, got %#v", result)
 	}
@@ -91,7 +103,7 @@ func TestMissingToolResult_ArgsErr(t *testing.T) {
 		ArgsErr:      fmt.Errorf("unexpected end of JSON"),
 	}
 	_, _ = sess.AppendAssistantMessage("", []openai.ToolCall{tc.ToOpenAI()})
-	content, result, _ := dispatchToolCall(context.Background(), tc, reg, env, AutoApprove{}, sess, todos, DefaultLoopConfig(), func(AgentEvent) {})
+	content, result, _ := dispatchToolCall(context.Background(), tc, testDeps(sess, reg, env, AutoApprove{}, todos), DefaultLoopConfig(), func(AgentEvent) {})
 	if !result.IsError || !strings.Contains(content, "Invalid tool arguments") {
 		t.Fatalf("expected ArgsErr result, got %#v content=%q", result, content)
 	}
@@ -110,7 +122,7 @@ func TestMissingToolResult_UnknownTool(t *testing.T) {
 		Arguments:    map[string]interface{}{},
 	}
 	_, _ = sess.AppendAssistantMessage("", []openai.ToolCall{tc.ToOpenAI()})
-	content, result, _ := dispatchToolCall(context.Background(), tc, reg, env, AutoApprove{}, sess, todos, DefaultLoopConfig(), func(AgentEvent) {})
+	content, result, _ := dispatchToolCall(context.Background(), tc, testDeps(sess, reg, env, AutoApprove{}, todos), DefaultLoopConfig(), func(AgentEvent) {})
 	if !result.IsError || !strings.Contains(content, "Unknown tool") {
 		t.Fatalf("expected unknown tool, got %#v", result)
 	}
