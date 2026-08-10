@@ -60,6 +60,9 @@ type Model struct {
 	copyStatus            string
 	todosPanel            string
 	picker                pickerState
+	suggestIdx            int
+	lastInputValue        string
+	viewportBase          int
 }
 
 type selectionPos struct {
@@ -320,11 +323,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		viewportHeight := m.height - 8
-		if viewportHeight < 5 {
-			viewportHeight = 5
+		if viewportHeight < minViewportRows {
+			viewportHeight = minViewportRows
 		}
 		m.viewport.SetWidth(m.width)
 		m.viewport.SetHeight(viewportHeight)
+		// Remember the unreduced height; View() subtracts the suggestion
+		// popup from this base each frame.
+		m.viewportBase = viewportHeight
 		m.syncViewportContent()
 
 	case tea.MouseWheelMsg:
@@ -379,6 +385,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.syncViewportContent()
 			return m, nil
+		}
+
+		// Slash-command suggestions — only while a command name is being typed
+		// (no space yet) and not mid-turn, so Enter/Tab/↑/↓ don't collide with
+		// their normal jobs once the user has moved on to arguments or a reply.
+		if !m.scrollMode && !m.streaming {
+			if suggestions := m.slashSuggestions(); len(suggestions) > 0 {
+				// Match key.Code as well as the string form (as the Enter handling
+				// below already does), rather than relying on String() alone.
+				if key.Code == tea.KeyDown || key.String() == "ctrl+n" {
+					m.suggestIdx = (m.suggestIdx + 1) % len(suggestions)
+					return m, nil
+				}
+				if key.Code == tea.KeyUp || key.String() == "ctrl+p" {
+					m.suggestIdx = (m.suggestIdx - 1 + len(suggestions)) % len(suggestions)
+					return m, nil
+				}
+				switch key.String() {
+				case "tab":
+					chosen := m.selectedSuggestion(suggestions)
+					m.input.SetValue("/" + chosen.Name + " ")
+					m.input.CursorEnd()
+					m.suggestIdx = 0
+					return m, nil
+				case "esc":
+					m.input.SetValue("")
+					m.suggestIdx = 0
+					return m, nil
+				}
+				if key.Code == tea.KeyEnter {
+					chosen := m.selectedSuggestion(suggestions)
+					m.input.SetValue("")
+					m.suggestIdx = 0
+					return m, m.sendMessage("/" + chosen.Name)
+				}
+			}
 		}
 
 		if m.scrollMode {
@@ -458,11 +500,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case 'c', 'd':
 				return m, tea.Quit
 			case 'l':
+				// Same effect as /clear.
 				if !m.streaming && !m.scrollMode {
-					m.messages = nil
-					m.todosPanel = ""
 					if m.harness != nil {
 						m.startNewSession()
+					} else {
+						m.messages = nil
+						m.todosPanel = ""
 					}
 					m.copyStatus = ""
 					m.syncViewportContent()
@@ -603,6 +647,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.input, cmd = m.input.Update(msg)
 	cmds = append(cmds, cmd)
 
+	// Re-highlight the top match when a keystroke changed the typed text.
+	// Both guards matter: resetting unconditionally would fire on every
+	// spinner tick — which arrives continuously — wiping out the ↑/↓ selection
+	// milliseconds after the user made it. Gating on the message type (not
+	// just the value) keeps that true even if some other path set the input
+	// directly and left lastInputValue stale.
+	if _, isKey := msg.(tea.KeyPressMsg); isKey {
+		if v := m.input.Value(); v != m.lastInputValue {
+			m.lastInputValue = v
+			m.suggestIdx = 0
+		}
+	}
+
 	return m, tea.Batch(cmds...)
 }
 
@@ -622,6 +679,29 @@ func (m Model) View() tea.View {
 	b.WriteString(header)
 	b.WriteString("\n")
 
+	// The suggestion popup has to be sized before the viewport is rendered:
+	// it takes its rows out of the viewport's budget rather than adding to the
+	// frame. If the frame grows taller than the terminal, the terminal scrolls
+	// it and the cursor row computed below no longer matches the screen.
+	suggestions := m.slashSuggestions()
+	showSuggestions := !m.scrollMode && !m.streaming && len(suggestions) > 0
+
+	popupRows := 0
+	if showSuggestions {
+		popupRows = len(suggestions) + 1 // rows plus the blank line beneath them
+		if budget := m.viewportBase - minViewportRows; popupRows > budget {
+			popupRows = budget
+		}
+		if popupRows <= 1 {
+			showSuggestions, popupRows = false, 0
+		} else {
+			suggestions = suggestions[:popupRows-1]
+		}
+	}
+	// Always derive from the base height rather than subtracting from the
+	// current one, so repeated frames can't compound the shrink.
+	m.viewport.SetHeight(max(minViewportRows, m.viewportBase-popupRows))
+
 	messagesView := m.renderMessagesView()
 	shouldFollowBottom := m.streaming || m.viewport.AtBottom()
 	m.viewport.SetContent(messagesView)
@@ -632,7 +712,10 @@ func (m Model) View() tea.View {
 	b.WriteString("\n")
 
 	var statusText string
-	if m.picker.active {
+	if showSuggestions {
+		statusText = m.styles.Chat.Footer.Render(
+			"↑/↓: select | Tab: complete | Enter: run | Esc: cancel")
+	} else if m.picker.active {
 		statusText = m.styles.Chat.Footer.Render(
 			"Sessions · j/k: move | Enter: resume | f: fork | d: delete | Esc: back")
 	} else if m.awaitingApproval {
@@ -656,6 +739,11 @@ func (m Model) View() tea.View {
 	statusBar := m.styles.Chat.StatusBar.Width(m.width).Render(statusText)
 	b.WriteString(statusBar)
 	b.WriteString("\n\n")
+
+	if showSuggestions {
+		b.WriteString(m.renderSuggestions(suggestions, m.width-2))
+		b.WriteString("\n\n")
+	}
 
 	inputY := countLines(b.String()) - 1
 
@@ -1318,13 +1406,25 @@ func (m *Model) startNewSession() {
 		Todos:     todos,
 		Session:   sess,
 		Approvals: m.approvals,
+		// Carry the memory store over: without it the replacement harness has
+		// no store, and episodic digests silently stop being recorded for the
+		// rest of the run.
+		Memory:    m.memory,
 		PromptCfg: m.promptCfg,
 	})
 	if err != nil {
+		applog.Printf("ui: new harness: %v", err)
 		m.harness.NewSession(m.cfg, m.promptCfg)
 		return
 	}
 	m.harness = h
+	// Repoint the shared handle the memory tool reads, or facts stored after
+	// this point would be attributed to the previous session.
+	if m.active != nil {
+		m.active.set(sess)
+	}
+	m.messages = nil
+	m.todosPanel = ""
 }
 
 func truncateRunes(s string, max int) string {

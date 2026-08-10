@@ -71,8 +71,8 @@ func TestMemoryTool_RejectsBadInput(t *testing.T) {
 	ctx := context.Background()
 
 	cases := []map[string]any{
-		{"action": "remember"},                                  // no content
-		{"action": "bogus"},                                     // unknown action
+		{"action": "remember"}, // no content
+		{"action": "bogus"},    // unknown action
 		{"action": "remember", "content": "x", "tier": "wrong"}, // bad tier
 		{"action": "remember", "content": "x", "scope": "wrong"},
 		{"action": "forget"}, // no id

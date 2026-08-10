@@ -27,6 +27,23 @@ func (m *Model) handleSlashCommand(text string) (tea.Cmd, bool) {
 	rest = strings.TrimSpace(rest)
 
 	switch cmd {
+	case "clear":
+		// Clears the screen and starts a fresh conversation, same as Ctrl+L.
+		// The previous session is not deleted — it stays on disk and remains
+		// resumable through /sessions.
+		m.copyStatus = ""
+		m.selectionMode = false
+		m.selectableText = ""
+		m.selectableLines = nil
+		m.selectionAnchor = selectionPos{}
+		m.selectionCursor = selectionPos{}
+		if m.harness != nil {
+			m.startNewSession()
+		} else {
+			m.messages = nil
+			m.todosPanel = ""
+		}
+		return nil, true
 	case "compact":
 		return m.compactCmd(), true
 	case "sessions", "resume":
@@ -61,16 +78,6 @@ func ifRest(rest string) string {
 		return ""
 	}
 	return " " + rest
-}
-
-func slashHelp() string {
-	return "Commands:\n" +
-		"  /compact       — summarize older turns to reclaim context now\n" +
-		"  /context       — show context usage\n" +
-		"  /sessions      — browse, resume, fork or delete saved sessions\n" +
-		"  /reindex       — rebuild the project map used by semantic memory\n" +
-		"  /memory [text] — list memories, or search them\n" +
-		"  /help          — this list"
 }
 
 func (m *Model) contextReport() string {
@@ -157,7 +164,13 @@ func (m *Model) autoIndexCmd() tea.Cmd {
 }
 
 // memoryReportCmd lists or searches stored memories.
-func (m *Model) memoryReportCmd(query string) tea.Cmd {
+//
+// A bare /memory deliberately excludes the semantic tier. Semantic memory is a
+// derived index of the codebase rebuilt by /reindex — dozens of
+// "package:foo"/"file:bar.go" rows that would bury the handful of things the
+// agent actually remembered. It stays reachable via `/memory semantic` and is
+// always searched by `/memory <query>`.
+func (m *Model) memoryReportCmd(arg string) tea.Cmd {
 	if m.memory == nil {
 		m.messages = append(m.messages, Message{
 			Role:    RoleError,
@@ -167,38 +180,67 @@ func (m *Model) memoryReportCmd(query string) tea.Cmd {
 	}
 	store := m.memory
 	ctx := m.ctx
+	arg = strings.TrimSpace(arg)
+
 	return func() tea.Msg {
-		var (
-			recs []memory.Record
-			err  error
-		)
-		if strings.TrimSpace(query) == "" {
-			recs, err = store.List(ctx, "", 20)
-		} else {
-			recs, err = store.Search(ctx, "", query, 20)
+		// "/memory <tier>" browses one tier; anything else is a search.
+		if arg != "" && memory.ValidTier(arg) {
+			recs, err := store.List(ctx, memory.Tier(arg), 40)
+			if err != nil {
+				return MemoryReportMsg{Err: err}
+			}
+			return MemoryReportMsg{Report: formatMemoryList(
+				fmt.Sprintf("%s memories", arg), recs, "")}
 		}
+		if arg != "" {
+			recs, err := store.Search(ctx, "", arg, 20)
+			if err != nil {
+				return MemoryReportMsg{Err: err}
+			}
+			return MemoryReportMsg{Report: formatMemoryList(
+				fmt.Sprintf("Search %q", arg), recs, "")}
+		}
+
+		var recalled []memory.Record
+		for _, tier := range []memory.Tier{memory.TierProcedural, memory.TierEpisodic} {
+			recs, err := store.List(ctx, tier, 15)
+			if err != nil {
+				return MemoryReportMsg{Err: err}
+			}
+			recalled = append(recalled, recs...)
+		}
+		// Report the index size rather than listing it.
+		semantic, err := store.List(ctx, memory.TierSemantic, 1000)
 		if err != nil {
 			return MemoryReportMsg{Err: err}
 		}
-		if len(recs) == 0 {
-			return MemoryReportMsg{Report: "No memories stored yet. Try /reindex, or ask me to remember something."}
-		}
-		var b strings.Builder
-		byTier := map[memory.Tier]int{}
-		for _, r := range recs {
-			byTier[r.Tier]++
-		}
-		fmt.Fprintf(&b, "Memories (%d shown — procedural %d, episodic %d, semantic %d):\n",
-			len(recs), byTier[memory.TierProcedural], byTier[memory.TierEpisodic], byTier[memory.TierSemantic])
-		for _, r := range recs {
-			label := r.Key
-			if label == "" {
-				label = firstLine(r.Content)
-			}
-			fmt.Fprintf(&b, "  [%s/%s] %s\n", r.Tier, r.Scope, truncateRunes(label, 90))
-		}
-		return MemoryReportMsg{Report: strings.TrimRight(b.String(), "\n")}
+		footer := fmt.Sprintf(
+			"\n\n%d semantic entries indexed from the project — /memory semantic to browse, /reindex to rebuild.",
+			len(semantic))
+		return MemoryReportMsg{Report: formatMemoryList("Memories", recalled, footer)}
 	}
+}
+
+// formatMemoryList renders records one per line, newest first.
+func formatMemoryList(title string, recs []memory.Record, footer string) string {
+	if len(recs) == 0 {
+		if footer != "" {
+			return "Nothing remembered yet." + footer
+		}
+		return "No matching memories."
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s (%d):\n", title, len(recs))
+	for _, r := range recs {
+		// Show the content, not just the key — a key like "style" says nothing
+		// about what was actually remembered.
+		label := firstLine(r.Content)
+		if r.Key != "" {
+			label = r.Key + ": " + label
+		}
+		fmt.Fprintf(&b, "  [%s/%s] %s\n", r.Tier, r.Scope, truncateRunes(label, 100))
+	}
+	return strings.TrimRight(b.String(), "\n") + footer
 }
 
 // compactCmd runs compaction off the UI goroutine; Bubble Tea must never block.

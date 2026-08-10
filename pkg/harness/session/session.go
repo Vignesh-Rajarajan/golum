@@ -127,13 +127,13 @@ type Session interface {
 
 // InMemorySession wraps ContextManager with Entry recording.
 type InMemorySession struct {
-	id             string
-	label          string
-	ctxMgr         *contextmgr.ContextManager
-	entries        []Entry
-	parentID       string
-	seq            int
-	alwaysAllow    map[string]bool
+	id          string
+	label       string
+	ctxMgr      *contextmgr.ContextManager
+	entries     []Entry
+	parentID    string
+	seq         int
+	alwaysAllow map[string]bool
 }
 
 // NewInMemorySession creates a session wrapping ctxMgr.
@@ -232,7 +232,6 @@ func (s *InMemorySession) AppendCompactionAt(summary, cutEntryID string) (Entry,
 		MetaCutEntryID: cutEntryID,
 	})
 }
-
 
 func (s *InMemorySession) AppendTodos(items any) (Entry, error) {
 	return s.append(EntryTodos, "", "", nil, map[string]any{"items": items})
