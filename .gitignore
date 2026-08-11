@@ -43,3 +43,6 @@ Thumbs.db
 /bin/
 /dist/
 
+# Behavioral eval artifacts (pkg/evals)
+pkg/evals/.eval/
+

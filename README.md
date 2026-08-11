@@ -42,8 +42,9 @@ a crash or a restart.
 │   ├── prompt/                  # System prompt assembly + prompt templates
 │   ├── hooks/                    # Typed lifecycle hooks
 │   ├── sanitize/                  # Strips pseudo-tool markup from model text
-│   └── tokenizer/                  # Token counting/estimation
-├── docs/                    # Architecture notes and API reference
+│   ├── tokenizer/                  # Token counting/estimation
+│   └── evals/                      # Behavioral eval harness (build tag: evals)
+├── scripts/                 # Helper scripts (e.g. run-evals.sh)
 └── examples/                # Standalone usage examples
 ```
 
@@ -108,10 +109,7 @@ instructions go in `AGENTS.md`; user-level instructions in `~/.golum/AGENTS.md`.
 - [github.com/google/uuid](https://github.com/google/uuid), [github.com/joho/godotenv](https://github.com/joho/godotenv)
 
 ## Documentation
-
-- [Harness architecture](./docs/HARNESS_ARCHITECTURE.md) — the agent loop, session model, and durability design
-- [API reference](./docs/API_REFERENCE.md)
-- [Integration tests](./docs/INTEGRATION_TESTS.md)
+- [Behavioral evals](./pkg/evals/README.md) — model-backed harness checks (`scripts/run-evals.sh`)
 - [Examples](./examples/)
 
 ## License
