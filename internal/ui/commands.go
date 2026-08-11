@@ -8,6 +8,7 @@ import (
 	"github.com/Vignesh-Rajarajan/golum/pkg/applog"
 	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
 	"github.com/Vignesh-Rajarajan/golum/pkg/memory"
+	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
 )
 
 // CompactDoneMsg reports the outcome of a manual /compact.
@@ -58,13 +59,101 @@ func (m *Model) handleSlashCommand(text string) (tea.Cmd, bool) {
 			Content: m.contextReport(),
 		})
 		return nil, true
+	case "model":
+		if m.harness == nil || rest == "" {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: "Usage: /model <name>"})
+		} else if err := m.harness.SetModel(rest); err != nil {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: err.Error()})
+		} else {
+			m.messages = append(m.messages, Message{Role: RoleSystem, Content: "Model set to " + rest})
+		}
+		return nil, true
+	case "think":
+		if m.harness == nil || rest == "" {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: "Usage: /think <level>"})
+		} else if err := m.harness.SetThinkingLevel(rest); err != nil {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: err.Error()})
+		} else {
+			m.messages = append(m.messages, Message{Role: RoleSystem, Content: "Thinking level set to " + rest})
+		}
+		return nil, true
+	case "tools":
+		if m.harness == nil || rest == "" {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: "Usage: /tools <name,...>"})
+		} else {
+			names := strings.FieldsFunc(rest, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })
+			if err := m.harness.SetActiveTools(names); err != nil {
+				m.messages = append(m.messages, Message{Role: RoleError, Content: err.Error()})
+			} else {
+				m.messages = append(m.messages, Message{Role: RoleSystem, Content: "Active tools: " + strings.Join(names, ", ")})
+			}
+		}
+		return nil, true
+	case "cancel":
+		if m.harness == nil || rest == "" {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: "Usage: /cancel <queue-id>"})
+		} else if err := m.harness.CancelQueued(m.ctx, rest); err != nil {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: err.Error()})
+		} else {
+			filtered := m.queued[:0]
+			for _, item := range m.queued {
+				if item.ID != rest {
+					filtered = append(filtered, item)
+				}
+			}
+			m.queued = filtered
+			m.messages = append(m.messages, Message{Role: RoleSystem, Content: "Cancelled queued item " + rest})
+		}
+		return nil, true
+	case "resume-run":
+		if m.harness == nil {
+			return nil, true
+		}
+		m.streaming = true
+		h := m.harness
+		ctx := m.ctx
+		return func() tea.Msg {
+			_, err := h.Resume(ctx)
+			return ResumeRunDoneMsg{Err: err}
+		}, true
+	case "abort-run":
+		if m.harness == nil {
+			return nil, true
+		}
+		if _, err := m.harness.AbortContext(m.ctx); err != nil {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: err.Error()})
+		} else {
+			m.messages = append(m.messages, Message{Role: RoleSystem, Content: "Suspended operation aborted."})
+		}
+		return nil, true
 	case "help":
+		help := slashHelp()
+		if len(m.templates) > 0 {
+			help += "\n\nProject templates:"
+			for _, tmpl := range m.templates {
+				help += "\n  /" + tmpl.Name + " [args]"
+			}
+		}
 		m.messages = append(m.messages, Message{
 			Role:    RoleSystem,
-			Content: slashHelp(),
+			Content: help,
 		})
 		return nil, true
 	default:
+		for _, tmpl := range m.templates {
+			if tmpl.Name != cmd {
+				continue
+			}
+			args, err := prompt.ParseCommandArgs(rest)
+			if err != nil {
+				m.messages = append(m.messages, Message{Role: RoleError, Content: err.Error()})
+				return nil, true
+			}
+			invocation := prompt.FormatPromptTemplateInvocation(tmpl, args)
+			m.messages = append(m.messages, Message{Role: RoleUser, Content: invocation})
+			m.streaming = true
+			return m.startAgent(invocation), true
+		}
 		m.messages = append(m.messages, Message{
 			Role:    RoleError,
 			Content: fmt.Sprintf("Unknown command %q. Try /help.", "/"+cmd+ifRest(rest)),

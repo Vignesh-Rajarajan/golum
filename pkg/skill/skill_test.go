@@ -36,3 +36,18 @@ func TestLoadSkills(t *testing.T) {
 		t.Fatalf("%q", sec)
 	}
 }
+
+func TestDisabledModelInvocationIsHiddenButExplicitlyInvokable(t *testing.T) {
+	sk := Skill{
+		Name: "manual-only", Description: "Explicit invocation only",
+		Body: "Do the manual thing.", FilePath: ".golum/skills/manual-only.md",
+		DisableModelInvocation: true,
+	}
+	if section := FormatSkillsSection([]Skill{sk}); strings.Contains(section, sk.Name) {
+		t.Fatalf("disabled skill leaked into model skill list: %q", section)
+	}
+	invocation := FormatSkillInvocation(sk, "extra")
+	if !strings.Contains(invocation, sk.Name) || !strings.Contains(invocation, sk.Body) {
+		t.Fatalf("disabled skill cannot be explicitly invoked: %q", invocation)
+	}
+}

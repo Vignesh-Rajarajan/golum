@@ -114,6 +114,9 @@ func (c *Client) buildRequest(
 		Messages: messages,
 		Stream:   opts.Stream,
 	}
+	if opts.Model != "" {
+		req.Model = opts.Model
+	}
 
 	if opts.Stream {
 		req.StreamOptions = &openai.StreamOptions{

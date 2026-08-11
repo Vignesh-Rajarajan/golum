@@ -29,6 +29,12 @@ var slashCommandCatalog = []slashCommandSpec{
 	{Name: "sessions", Desc: "Browse, resume, fork or delete saved sessions"},
 	{Name: "reindex", Desc: "Rebuild the project map used by semantic memory"},
 	{Name: "memory", Args: "[query|tier]", Desc: "List what's remembered, or search it"},
+	{Name: "model", Args: "<name>", Desc: "Change the model for this session branch"},
+	{Name: "think", Args: "<level>", Desc: "Change the thinking level"},
+	{Name: "tools", Args: "<name,...>", Desc: "Set active tools for future requests"},
+	{Name: "cancel", Args: "<queue-id>", Desc: "Cancel a queued steer or follow-up"},
+	{Name: "resume-run", Desc: "Resume a suspended operation"},
+	{Name: "abort-run", Desc: "Abort a suspended operation"},
 	{Name: "help", Desc: "Show this list"},
 }
 
@@ -95,7 +101,16 @@ func (m Model) slashSuggestions() []slashCommandSpec {
 	if !active {
 		return nil
 	}
-	return matchingSlashCommands(query)
+	out := matchingSlashCommands(query)
+	q := strings.ToLower(query)
+	for _, tmpl := range m.templates {
+		if query == "" || strings.HasPrefix(strings.ToLower(tmpl.Name), q) {
+			out = append(out, slashCommandSpec{
+				Name: tmpl.Name, Args: "[args]", Desc: "Project prompt template",
+			})
+		}
+	}
+	return out
 }
 
 // selectedSuggestion returns the highlighted entry, clamped to the current

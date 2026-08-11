@@ -135,10 +135,10 @@ func importJSONLFile(ctx context.Context, store *SQLiteStore, id, path string) e
 			e.Time = created
 		}
 		RehydrateEntry(&e)
-		if err := sess.InMemorySession.ReplayEntry(e); err != nil {
-			return err
-		}
-		if err := sess.persist(ctx, e); err != nil {
+		if _, err := sess.AppendProvisioned(ProvisionedEntry{
+			ID: e.ID, Kind: e.Kind, Role: e.Role, Content: e.Content,
+			ToolCall: e.ToolCall, Meta: e.Meta,
+		}); err != nil {
 			return err
 		}
 		if label := labelFromEntry(e); label != "" {

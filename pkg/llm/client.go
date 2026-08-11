@@ -1,8 +1,6 @@
 package llm
 
 import (
-	"context"
-
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
 	"github.com/sashabaranov/go-openai"
 )
@@ -34,16 +32,4 @@ func NewClient(cfg *config.Config) *Client {
 		client: client,
 		config: cfg,
 	}
-}
-
-func (c *Client) Complete(ctx context.Context, messages []openai.ChatCompletionMessage) (string, error) {
-	resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model:    c.config.Model,
-		Messages: messages,
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return resp.Choices[0].Message.Content, nil
 }

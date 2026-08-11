@@ -13,6 +13,7 @@ import (
 	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness/session"
+	"github.com/Vignesh-Rajarajan/golum/pkg/hooks"
 	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
 	"github.com/Vignesh-Rajarajan/golum/pkg/memory"
 	"github.com/Vignesh-Rajarajan/golum/pkg/observability"
@@ -33,6 +34,7 @@ const (
 	EventToolCallAwaitingApproval AgentEventType = "tool_call_awaiting_approval"
 	EventToolCallResult           AgentEventType = "tool_call_result"
 	EventTodosChanged             AgentEventType = "todos_changed"
+	EventQueueConsumed            AgentEventType = "queue_consumed"
 	EventCompactionStart          AgentEventType = "compaction_start"
 	EventCompactionDone           AgentEventType = "compaction_done"
 	EventError                    AgentEventType = "error"
@@ -91,13 +93,16 @@ func (AutoApprove) Request(context.Context, llm.ToolCall) (bool, error) { return
 // LoopDeps bundles the collaborators RunAgentLoop needs. Grouping them keeps
 // the loop callable (and testable) without a ten-argument signature.
 type LoopDeps struct {
-	Client    *llm.Client
-	Session   session.Session
-	Registry  *tool.Registry
-	Env       execenv.ExecutionEnv
-	Approvals ApprovalBroker
-	Todos     *tool.TodoStore
-	Compactor *Compactor
+	Client      *llm.Client
+	Session     session.Session
+	Registry    *tool.Registry
+	Env         execenv.ExecutionEnv
+	Approvals   ApprovalBroker
+	Todos       *tool.TodoStore
+	Compactor   *Compactor
+	Hooks       *hooks.HooksManager
+	Model       string
+	ActiveTools []string
 	// Memory, when set, receives an episodic digest at the end of each turn.
 	Memory *memory.Store
 	// Episodic accumulates file changes and failures within a turn.
@@ -133,13 +138,32 @@ func RunAgentLoop(
 		emit = func(AgentEvent) {}
 	}
 
-	deadline := time.Time{}
-	if cfg.MaxWallClock > 0 {
-		deadline = time.Now().Add(cfg.MaxWallClock)
-	}
-
 	return observability.Wrap(observability.DefaultSink, "RunAgentLoop", func() error {
-		return runAgentLoopInner(ctx, deps, cfg, emit, deadline)
+		runCtx := ctx
+		cancel := func() {}
+		if cfg.MaxWallClock > 0 {
+			runCtx, cancel = context.WithTimeout(ctx, cfg.MaxWallClock)
+		}
+		defer cancel()
+		open, err := deps.Session.FindOpenOperations("main", 2)
+		if err != nil {
+			return err
+		}
+		if len(open) > 1 {
+			return &CorruptionError{Reason: CorruptionMultipleOpenOperations, Detail: "main"}
+		}
+		if len(open) == 0 {
+			runID := session.NewRecordID()
+			if _, err := deps.Session.AppendRecord(session.Record{
+				ID: stableID("r_start_", runID), Lane: "main",
+				Type: session.RecordOperationStarted, RunID: runID,
+				SourceLeafID: deps.Session.Leaf(),
+				Intent:       &session.OperationIntent{Kind: "run"},
+			}); err != nil {
+				return err
+			}
+		}
+		return NewDriver(deps, cfg, emit).RunToCompletion(runCtx)
 	})
 }
 

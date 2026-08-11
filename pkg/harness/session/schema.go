@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   cwd                  TEXT NOT NULL DEFAULT '',
   model                TEXT,
   leaf_entry_id        TEXT,
+  next_seq             INTEGER NOT NULL DEFAULT 0,
   created_at           INTEGER NOT NULL,
   updated_at           INTEGER NOT NULL
 );
@@ -50,6 +51,28 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS idx_entries_session_seq ON entries(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_entries_parent      ON entries(parent_id);
 CREATE INDEX IF NOT EXISTS idx_entries_tool_call   ON entries(tool_call_id);
+
+CREATE TABLE IF NOT EXISTS records (
+  id         TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  seq        INTEGER NOT NULL,
+  lane       TEXT NOT NULL DEFAULT 'main',
+  type       TEXT NOT NULL,
+  run_id     TEXT,
+  payload    TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_records_session_seq ON records(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_records_run ON records(session_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_records_type ON records(session_id, type);
+
+CREATE TABLE IF NOT EXISTS lanes (
+  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  lane          TEXT NOT NULL,
+  leaf_entry_id TEXT,
+  PRIMARY KEY (session_id, lane)
+);
 
 CREATE TABLE IF NOT EXISTS memories (
   id         TEXT PRIMARY KEY,

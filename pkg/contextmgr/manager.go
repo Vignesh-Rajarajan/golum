@@ -2,6 +2,7 @@ package contextmgr
 
 import (
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
@@ -19,14 +20,16 @@ const (
 
 // ContextManager holds system prompt, rolling messages, and usage accounting.
 type ContextManager struct {
+	mu sync.RWMutex
+
 	systemPrompt string
 	config       *config.Config
 	modelName    string
 	messages     []MessageItem
 
 	latestUsage TokenUsage
-	// TotalUsage accumulates usage across requests (Python: total_usage).
-	TotalUsage TokenUsage
+	// totalUsage accumulates usage across requests (Python: total_usage).
+	totalUsage TokenUsage
 
 	// systemTokens caches the frozen system prompt's token count.
 	systemTokens int
@@ -57,11 +60,19 @@ func NewContextManager(
 
 // MessageCount returns the number of stored messages (excluding system).
 func (m *ContextManager) MessageCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return len(m.messages)
 }
 
 // AddUserMessage appends a user message with token count.
 func (m *ContextManager) AddUserMessage(content string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addUserMessage(content)
+}
+
+func (m *ContextManager) addUserMessage(content string) {
 	n := tokenizer.CountTokens(content, m.modelName)
 	m.messages = append(m.messages, MessageItem{
 		Role:       openai.ChatMessageRoleUser,
@@ -72,6 +83,12 @@ func (m *ContextManager) AddUserMessage(content string) {
 
 // AddAssistantMessage appends an assistant message; toolCalls may be nil.
 func (m *ContextManager) AddAssistantMessage(content string, toolCalls []openai.ToolCall) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addAssistantMessage(content, toolCalls)
+}
+
+func (m *ContextManager) addAssistantMessage(content string, toolCalls []openai.ToolCall) {
 	n := tokenizer.CountTokens(content, m.modelName)
 	m.messages = append(m.messages, MessageItem{
 		Role:       openai.ChatMessageRoleAssistant,
@@ -83,6 +100,8 @@ func (m *ContextManager) AddAssistantMessage(content string, toolCalls []openai.
 
 // AddToolResult appends a tool role message with tool_call_id.
 func (m *ContextManager) AddToolResult(toolCallID, content string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	n := tokenizer.CountTokens(content, m.modelName)
 	m.messages = append(m.messages, MessageItem{
 		Role:       openai.ChatMessageRoleTool,
@@ -94,6 +113,8 @@ func (m *ContextManager) AddToolResult(toolCallID, content string) {
 
 // AddSystemNotice appends a system-role interstitial (e.g. loop-breaker notice).
 func (m *ContextManager) AddSystemNotice(content string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	n := tokenizer.CountTokens(content, m.modelName)
 	m.messages = append(m.messages, MessageItem{
 		Role:       openai.ChatMessageRoleSystem,
@@ -104,6 +125,8 @@ func (m *ContextManager) AddSystemNotice(content string) {
 
 // GetMessages returns system (if any) plus each message as map[string]any (Python get_messages).
 func (m *ContextManager) GetMessages() []map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	out := make([]map[string]any, 0, 1+len(m.messages))
 	if strings.TrimSpace(m.systemPrompt) != "" {
 		out = append(out, map[string]any{
@@ -119,6 +142,8 @@ func (m *ContextManager) GetMessages() []map[string]any {
 
 // ChatCompletionMessages returns messages in go-openai form, including system when set.
 func (m *ContextManager) ChatCompletionMessages() []openai.ChatCompletionMessage {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	out := make([]openai.ChatCompletionMessage, 0, 1+len(m.messages))
 	if strings.TrimSpace(m.systemPrompt) != "" {
 		out = append(out, openai.ChatCompletionMessage{
@@ -134,6 +159,8 @@ func (m *ContextManager) ChatCompletionMessages() []openai.ChatCompletionMessage
 
 // NeedsCompression is true when the last response usage exceeds 80% of context window.
 func (m *ContextManager) NeedsCompression() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var limit int
 	if m.config != nil {
 		limit = m.config.ContextWindowOrDefault()
@@ -148,16 +175,29 @@ func (m *ContextManager) NeedsCompression() bool {
 
 // SetLatestUsage stores usage from the most recent API response.
 func (m *ContextManager) SetLatestUsage(u TokenUsage) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.latestUsage = u
 }
 
 // AddUsage accumulates into TotalUsage.
 func (m *ContextManager) AddUsage(u TokenUsage) {
-	m.TotalUsage.Add(u)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.totalUsage.Add(u)
+}
+
+// TotalUsage returns a snapshot of cumulative request usage.
+func (m *ContextManager) TotalUsage() TokenUsage {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.totalUsage
 }
 
 // ReplaceWithSummary clears history and injects summary + ack + continue user messages.
 func (m *ContextManager) ReplaceWithSummary(summary string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.messages = nil
 
 	continuationContent := "# Context Restoration (Previous Session Compacted)\n\n" +
@@ -168,7 +208,7 @@ func (m *ContextManager) ReplaceWithSummary(summary string) {
 		"---\n\n" +
 		"Resume work from where we left off. Focus ONLY on the remaining tasks."
 
-	m.AddUserMessage(continuationContent)
+	m.addUserMessage(continuationContent)
 
 	ackContent := "I've reviewed the context from the previous session. I understand:\n" +
 		"- The original goal and what was requested\n" +
@@ -177,17 +217,19 @@ func (m *ContextManager) ReplaceWithSummary(summary string) {
 		"- What still needs to be done\n\n" +
 		"I'll continue with the REMAINING tasks only, starting from where we left off."
 
-	m.AddAssistantMessage(ackContent, nil)
+	m.addAssistantMessage(ackContent, nil)
 
 	continueContent := "Continue with the REMAINING work only. Do NOT repeat any completed actions. " +
 		"Proceed with the next step as described in the context above."
 
-	m.AddUserMessage(continueContent)
+	m.addUserMessage(continueContent)
 }
 
 // PruneToolOutputs clears old tool message bodies when enough tokens can be reclaimed.
 // Returns the number of tool messages pruned.
 func (m *ContextManager) PruneToolOutputs() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if countRole(m.messages, openai.ChatMessageRoleUser) < 2 {
 		return 0
 	}
@@ -237,6 +279,8 @@ func (m *ContextManager) PruneToolOutputs() int {
 
 // Clear removes all non-system messages (same as Python clear).
 func (m *ContextManager) Clear() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.messages = nil
 }
 

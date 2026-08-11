@@ -2,6 +2,7 @@ package skill
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"strings"
 
@@ -10,10 +11,12 @@ import (
 
 // Skill is a markdown skill loaded from .golum/skills/*.md.
 type Skill struct {
-	Name        string
-	Description string
-	Body        string
-	RawFront    map[string]string
+	Name                   string
+	Description            string
+	Body                   string
+	RawFront               map[string]string
+	FilePath               string
+	DisableModelInvocation bool
 }
 
 // LoadSkills discovers skills under .golum/skills via the execution env.
@@ -37,6 +40,7 @@ func LoadSkills(ctx context.Context, env execenv.ExecutionEnv) ([]Skill, error) 
 		if err != nil {
 			continue
 		}
+		sk.FilePath = path
 		out = append(out, sk)
 	}
 	return out, nil
@@ -69,7 +73,10 @@ func parseSkill(filename, content string) (Skill, error) {
 		name = n
 	}
 	desc := front["description"]
-	return Skill{Name: name, Description: desc, Body: strings.TrimSpace(body), RawFront: front}, nil
+	disable := strings.EqualFold(front["disable-model-invocation"], "true") ||
+		strings.EqualFold(front["disable_model_invocation"], "true")
+	return Skill{Name: name, Description: desc, Body: strings.TrimSpace(body), RawFront: front,
+		DisableModelInvocation: disable}, nil
 }
 
 // FormatSkillsSection builds a system-prompt section from skills.
@@ -78,15 +85,35 @@ func FormatSkillsSection(skills []Skill) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("# Skills\n\n")
-	b.WriteString("The following project skills are available. Follow them when relevant.\n\n")
+	b.WriteString("# Skills\n\n<available_skills>\n")
 	for _, sk := range skills {
-		fmt.Fprintf(&b, "## %s\n", sk.Name)
-		if sk.Description != "" {
-			fmt.Fprintf(&b, "%s\n\n", sk.Description)
+		if sk.DisableModelInvocation {
+			continue
 		}
-		b.WriteString(sk.Body)
-		b.WriteString("\n\n")
+		fmt.Fprintf(&b, "<skill><name>%s</name><description>%s</description><location>%s</location>",
+			xmlEscape(sk.Name), xmlEscape(sk.Description), xmlEscape(sk.FilePath))
+		if sk.Body != "" {
+			fmt.Fprintf(&b, "<instructions>%s</instructions>", xmlEscape(sk.Body))
+		}
+		b.WriteString("</skill>\n")
 	}
-	return strings.TrimSpace(b.String())
+	b.WriteString("</available_skills>")
+	return b.String()
+}
+
+func FormatSkillInvocation(sk Skill, extra string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "<skill_invocation><name>%s</name><location>%s</location>",
+		xmlEscape(sk.Name), xmlEscape(sk.FilePath))
+	if extra != "" {
+		fmt.Fprintf(&b, "<extra>%s</extra>", xmlEscape(extra))
+	}
+	fmt.Fprintf(&b, "<instructions>%s</instructions></skill_invocation>", xmlEscape(sk.Body))
+	return b.String()
+}
+
+func xmlEscape(s string) string {
+	var b strings.Builder
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
 }

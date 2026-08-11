@@ -82,10 +82,11 @@ func (m *MessageItem) ToMap() map[string]any {
 
 // ToChatCompletionMessage converts to the go-openai request type.
 func (m *MessageItem) ToChatCompletionMessage() openai.ChatCompletionMessage {
+	toolCalls := append([]openai.ToolCall(nil), m.ToolCalls...)
 	return openai.ChatCompletionMessage{
 		Role:       m.Role,
 		Content:    m.Content,
-		ToolCalls:  m.ToolCalls,
+		ToolCalls:  toolCalls,
 		ToolCallID: m.ToolCallID,
 	}
 }

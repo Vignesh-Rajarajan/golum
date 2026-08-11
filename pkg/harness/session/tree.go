@@ -4,6 +4,12 @@ import "fmt"
 
 // GetEntry returns the entry with the given id.
 func (s *InMemorySession) GetEntry(id string) (Entry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getEntryLocked(id)
+}
+
+func (s *InMemorySession) getEntryLocked(id string) (Entry, bool) {
 	for i := range s.entries {
 		if s.entries[i].ID == id {
 			return s.entries[i], true
@@ -13,7 +19,11 @@ func (s *InMemorySession) GetEntry(id string) (Entry, bool) {
 }
 
 // Leaf returns the id of the current head of the session tree.
-func (s *InMemorySession) Leaf() string { return s.parentID }
+func (s *InMemorySession) Leaf() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.parentID
+}
 
 // GetPathToRoot returns the ancestor chain ending at id, ordered root-first.
 //
@@ -21,6 +31,12 @@ func (s *InMemorySession) Leaf() string { return s.parentID }
 // forking or moving the leaf creates siblings rather than rewriting history.
 // The "live" conversation is always one root-to-leaf path through it.
 func (s *InMemorySession) GetPathToRoot(id string) ([]Entry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getPathToRootLocked(id)
+}
+
+func (s *InMemorySession) getPathToRootLocked(id string) ([]Entry, error) {
 	if id == "" {
 		return nil, nil
 	}
@@ -54,7 +70,9 @@ func (s *InMemorySession) GetPathToRoot(id string) ([]Entry, error) {
 
 // GetBranch returns fromID and every entry descended from it, in log order.
 func (s *InMemorySession) GetBranch(fromID string) ([]Entry, error) {
-	if _, ok := s.GetEntry(fromID); !ok {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.getEntryLocked(fromID); !ok {
 		return nil, fmt.Errorf("entry %q not found", fromID)
 	}
 	inBranch := map[string]bool{fromID: true}
@@ -71,11 +89,11 @@ func (s *InMemorySession) GetBranch(fromID string) ([]Entry, error) {
 
 // activeEntries returns the root-to-leaf path that forms the live conversation.
 // For a session that has never branched this is simply the whole log.
-func (s *InMemorySession) activeEntries() []Entry {
+func (s *InMemorySession) activeEntriesLocked() []Entry {
 	if s.parentID == "" {
 		return s.entries
 	}
-	path, err := s.GetPathToRoot(s.parentID)
+	path, err := s.getPathToRootLocked(s.parentID)
 	if err != nil || len(path) == 0 {
 		// A broken chain must not silently truncate the conversation.
 		return s.entries
@@ -87,9 +105,11 @@ func (s *InMemorySession) activeEntries() []Entry {
 // resulting path. Subsequent appends branch from there, leaving the abandoned
 // entries in the log (and forkable).
 func (s *InMemorySession) MoveTo(entryID string) error {
-	if _, ok := s.GetEntry(entryID); !ok {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.getEntryLocked(entryID); !ok {
 		return fmt.Errorf("entry %q not found", entryID)
 	}
 	s.parentID = entryID
-	return s.RebuildContext()
+	return s.rebuildContextLocked()
 }

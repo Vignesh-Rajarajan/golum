@@ -103,6 +103,10 @@ func (c *Compactor) MaybeCompact(ctx context.Context, sess session.Session, emit
 // Compact runs compaction unconditionally (the manual path, and the recovery
 // path after a context-overflow error).
 func (c *Compactor) Compact(ctx context.Context, sess session.Session, emit func(AgentEvent)) (CompactionResult, error) {
+	return c.compact(ctx, sess, emit, "")
+}
+
+func (c *Compactor) compact(ctx context.Context, sess session.Session, emit func(AgentEvent), resultEntryID string) (CompactionResult, error) {
 	if sess == nil {
 		return CompactionResult{}, fmt.Errorf("no session")
 	}
@@ -163,9 +167,18 @@ func (c *Compactor) Compact(ctx context.Context, sess session.Session, emit func
 
 	// Snapshot so a failed rebuild can be rolled back rather than sending a
 	// context we know is malformed.
-	if _, err := sess.AppendCompactionAt(summary, derived[cut-1].ID); err != nil {
-		emit(AgentEvent{Type: EventCompactionDone, Compaction: &res, Err: err})
-		return res, err
+	var appendErr error
+	if resultEntryID != "" {
+		_, appendErr = sess.AppendProvisioned(session.ProvisionedEntry{
+			ID: resultEntryID, Kind: session.EntryCompaction, Content: summary,
+			Meta: map[string]any{session.MetaCutEntryID: derived[cut-1].ID},
+		})
+	} else {
+		_, appendErr = sess.AppendCompactionAt(summary, derived[cut-1].ID)
+	}
+	if appendErr != nil {
+		emit(AgentEvent{Type: EventCompactionDone, Compaction: &res, Err: appendErr})
+		return res, appendErr
 	}
 	if err := sess.RebuildContext(); err != nil {
 		emit(AgentEvent{Type: EventCompactionDone, Compaction: &res, Err: err})

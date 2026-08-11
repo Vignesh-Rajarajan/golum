@@ -1,5 +1,7 @@
 package session
 
+import "github.com/Vignesh-Rajarajan/golum/pkg/prompt"
+
 // MetaCutEntryID is the key under which a compaction entry records the last
 // entry it folded into its summary.
 const MetaCutEntryID = "cut_entry_id"
@@ -84,14 +86,22 @@ func FindValidEntryCutPoints(entries []Entry) []int {
 // ContextEntries returns the derived context entries for this session: the
 // live root-to-leaf path with the most recent compaction boundary applied.
 func (s *InMemorySession) ContextEntries() []Entry {
-	return DeriveContextEntries(s.activeEntries())
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return DeriveContextEntries(s.activeEntriesLocked())
 }
 
 // RebuildContext discards the ContextManager's cached messages and replays the
 // derived context entries onto it. The ContextManager is a cache of the log,
 // so it can always be reconstructed from entries.
 func (s *InMemorySession) RebuildContext() error {
-	derived := s.ContextEntries()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rebuildContextLocked()
+}
+
+func (s *InMemorySession) rebuildContextLocked() error {
+	derived := DeriveContextEntries(s.activeEntriesLocked())
 	s.ctxMgr.Clear()
 	for _, e := range derived {
 		if err := s.replayIntoContext(e); err != nil {
@@ -118,6 +128,8 @@ func (s *InMemorySession) replayIntoContext(e Entry) error {
 		// The boundary rebuilds the summary preamble at the head of context;
 		// surviving turns are replayed after it by RebuildContext.
 		s.ctxMgr.ApplySummaryPreamble(e.Content)
+	case EntryBranchSummary:
+		s.ctxMgr.AddSystemNotice(prompt.WrapBranchSummary(e.Content))
 	}
 	return nil
 }

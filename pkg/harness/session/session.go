@@ -3,10 +3,12 @@ package session
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
 	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
+	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -22,6 +24,7 @@ const (
 	EntryModelChange         EntryKind = "model_change"
 	EntryActiveToolsChange   EntryKind = "active_tools_change"
 	EntryCompaction          EntryKind = "compaction"
+	EntryBranchSummary       EntryKind = "branch_summary"
 	EntryLabel               EntryKind = "label"
 	EntryCustom              EntryKind = "custom"
 	EntryTodos               EntryKind = "todos"
@@ -92,6 +95,10 @@ func RehydrateEntry(e *Entry) {
 // Session is the durability + context surface used by RunAgentLoop.
 type Session interface {
 	ID() string
+	AppendProvisioned(p ProvisionedEntry) (Entry, error)
+	AppendRecord(r Record) (Record, error)
+	FindRecords(q RecordQuery) ([]Record, error)
+	FindOpenOperations(lane string, limit int) ([]Record, error)
 	AppendUserMessage(content string) (Entry, error)
 	AppendAssistantMessage(content string, toolCalls []openai.ToolCall) (Entry, error)
 	AppendToolResult(toolCallID, content string) (Entry, error)
@@ -102,6 +109,9 @@ type Session interface {
 	AppendCompactionAt(summary, cutEntryID string) (Entry, error)
 	AppendTodos(items any) (Entry, error)
 	AppendApprovalAlways(toolName string) (Entry, error)
+	AppendModelChange(model string) (Entry, error)
+	AppendThinkingLevelChange(level string) (Entry, error)
+	AppendActiveToolsChange(names []string) (Entry, error)
 	BuildContext() ([]openai.ChatCompletionMessage, error)
 	ContextManager() *contextmgr.ContextManager
 	Entries() []Entry
@@ -127,10 +137,13 @@ type Session interface {
 
 // InMemorySession wraps ContextManager with Entry recording.
 type InMemorySession struct {
+	mu sync.RWMutex
+
 	id          string
 	label       string
 	ctxMgr      *contextmgr.ContextManager
 	entries     []Entry
+	records     []Record
 	parentID    string
 	seq         int
 	alwaysAllow map[string]bool
@@ -148,29 +161,43 @@ func NewInMemorySession(id string, ctxMgr *contextmgr.ContextManager) *InMemoryS
 	}
 }
 
-func (s *InMemorySession) ID() string { return s.id }
+func (s *InMemorySession) ID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.id
+}
 
 func (s *InMemorySession) ContextManager() *contextmgr.ContextManager { return s.ctxMgr }
 
 func (s *InMemorySession) Entries() []Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make([]Entry, len(s.entries))
 	copy(out, s.entries)
 	return out
 }
 
-func (s *InMemorySession) Label() string { return s.label }
+func (s *InMemorySession) Label() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.label
+}
 
 func (s *InMemorySession) SetLabel(label string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.label = label
-	_, err := s.append(EntryLabel, "", label, nil, nil)
+	_, err := s.appendLocked(EntryLabel, "", label, nil, nil)
 	return err
 }
 
 func (s *InMemorySession) AlwaysAllowed(toolName string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.alwaysAllow[toolName]
 }
 
-func (s *InMemorySession) append(kind EntryKind, role, content string, toolCall *llm.ToolCall, meta map[string]any) (Entry, error) {
+func (s *InMemorySession) appendLocked(kind EntryKind, role, content string, toolCall *llm.ToolCall, meta map[string]any) (Entry, error) {
 	s.seq++
 	e := Entry{
 		ID:       NewEntryID(),
@@ -188,37 +215,155 @@ func (s *InMemorySession) append(kind EntryKind, role, content string, toolCall 
 	return e, nil
 }
 
+// AppendProvisioned appends p exactly once. Repeating an identical write is a
+// lookup; reusing the id for another payload is corruption.
+func (s *InMemorySession) AppendProvisioned(p ProvisionedEntry) (Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.ID == "" {
+		return Entry{}, fmt.Errorf("provisioned entry id required")
+	}
+	if existing, ok := s.getEntryLocked(p.ID); ok {
+		if !p.Matches(existing) {
+			return Entry{}, &ProvisionedEntryMismatchError{ID: p.ID}
+		}
+		return existing, nil
+	}
+	s.seq++
+	e := Entry{
+		ID: p.ID, ParentID: s.parentID, Seq: s.seq, Kind: p.Kind,
+		Role: p.Role, Content: p.Content, ToolCall: p.ToolCall, Meta: p.Meta,
+		Time: time.Now().UTC(),
+	}
+	s.appendStoredLocked(e)
+	return e, nil
+}
+
+func (s *InMemorySession) appendStoredLocked(e Entry) {
+	switch e.Kind {
+	case EntryUserMessage:
+		s.ctxMgr.AddUserMessage(e.Content)
+	case EntryAssistantMessage:
+		s.ctxMgr.AddAssistantMessage(e.Content, toolCallsFromMeta(e.Meta))
+	case EntryToolResult:
+		s.ctxMgr.AddToolResult(e.ToolCallID(), e.Content)
+	case EntrySystemNotice:
+		s.ctxMgr.AddSystemNotice(e.Content)
+	case EntryBranchSummary:
+		s.ctxMgr.AddSystemNotice(prompt.WrapBranchSummary(e.Content))
+	case EntryLabel:
+		s.label = e.Content
+	case EntryApprovalAlways:
+		s.alwaysAllow[e.Content] = true
+	}
+	s.entries = append(s.entries, e)
+	s.parentID = e.ID
+	if e.Seq > s.seq {
+		s.seq = e.Seq
+	}
+}
+
+type ProvisionedEntryMismatchError struct{ ID string }
+
+func (e *ProvisionedEntryMismatchError) Error() string {
+	return fmt.Sprintf("provisioned_entry_mismatch: entry %q has different payload", e.ID)
+}
+
+func (s *InMemorySession) AppendRecord(r Record) (Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.ID == "" {
+		r.ID = NewRecordID()
+	}
+	if r.Lane == "" {
+		r.Lane = "main"
+	}
+	if err := r.Validate(); err != nil {
+		return Record{}, err
+	}
+	for _, existing := range s.records {
+		if existing.ID == r.ID {
+			return existing, nil
+		}
+	}
+	s.seq++
+	r.Seq = int64(s.seq)
+	if r.Time.IsZero() {
+		r.Time = time.Now().UTC()
+	}
+	s.records = append(s.records, r)
+	return r, nil
+}
+
+func (s *InMemorySession) FindRecords(q RecordQuery) ([]Record, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []Record
+	for _, r := range s.records {
+		if q.Lane != "" && r.Lane != q.Lane || q.RunID != "" && r.RunID != q.RunID ||
+			q.Type != "" && r.Type != q.Type || r.Seq <= q.After {
+			continue
+		}
+		out = append(out, r)
+		if q.Limit > 0 && len(out) == q.Limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *InMemorySession) FindOpenOperations(lane string, limit int) ([]Record, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	finished := map[string]bool{}
+	for _, r := range s.records {
+		if r.Type == RecordOperationFinished {
+			finished[r.RunID] = true
+		}
+	}
+	var out []Record
+	for i := len(s.records) - 1; i >= 0; i-- {
+		r := s.records[i]
+		if r.Type != RecordOperationStarted || lane != "" && r.Lane != lane || finished[r.RunID] {
+			continue
+		}
+		out = append(out, r)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (s *InMemorySession) AppendUserMessage(content string) (Entry, error) {
-	s.ctxMgr.AddUserMessage(content)
-	return s.append(EntryUserMessage, openai.ChatMessageRoleUser, content, nil, nil)
+	return s.AppendProvisioned(provision(EntryUserMessage, openai.ChatMessageRoleUser, content, nil, nil))
 }
 
 func (s *InMemorySession) AppendAssistantMessage(content string, toolCalls []openai.ToolCall) (Entry, error) {
-	s.ctxMgr.AddAssistantMessage(content, toolCalls)
 	meta := map[string]any{}
 	if len(toolCalls) > 0 {
 		meta["tool_calls"] = toolCalls
 	}
-	return s.append(EntryAssistantMessage, openai.ChatMessageRoleAssistant, content, nil, meta)
+	return s.AppendProvisioned(provision(EntryAssistantMessage, openai.ChatMessageRoleAssistant, content, nil, meta))
 }
 
 func (s *InMemorySession) AppendToolResult(toolCallID, content string) (Entry, error) {
-	s.ctxMgr.AddToolResult(toolCallID, content)
-	return s.append(EntryToolResult, openai.ChatMessageRoleTool, content, nil, map[string]any{
+	return s.AppendProvisioned(provision(EntryToolResult, openai.ChatMessageRoleTool, content, nil, map[string]any{
 		"tool_call_id": toolCallID,
-	})
+	}))
 }
 
 func (s *InMemorySession) AppendSystemNotice(content string) (Entry, error) {
-	s.ctxMgr.AddSystemNotice(content)
-	return s.append(EntrySystemNotice, openai.ChatMessageRoleSystem, content, nil, nil)
+	return s.AppendProvisioned(provision(EntrySystemNotice, openai.ChatMessageRoleSystem, content, nil, nil))
 }
 
 // AppendCompaction folds the entire history into a summary. Prefer
 // AppendCompactionAt, which keeps recent turns.
 func (s *InMemorySession) AppendCompaction(summary string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.ctxMgr.ReplaceWithSummary(summary)
-	_, err := s.append(EntryCompaction, "", summary, nil, nil)
+	_, err := s.appendLocked(EntryCompaction, "", summary, nil, nil)
 	return err
 }
 
@@ -228,18 +373,29 @@ func (s *InMemorySession) AppendCompaction(summary string) error {
 // ContextManager (see contextmgr.CompactPrefix) — this records the boundary so
 // the same context can be rebuilt on reload.
 func (s *InMemorySession) AppendCompactionAt(summary, cutEntryID string) (Entry, error) {
-	return s.append(EntryCompaction, "", summary, nil, map[string]any{
+	return s.AppendProvisioned(provision(EntryCompaction, "", summary, nil, map[string]any{
 		MetaCutEntryID: cutEntryID,
-	})
+	}))
 }
 
 func (s *InMemorySession) AppendTodos(items any) (Entry, error) {
-	return s.append(EntryTodos, "", "", nil, map[string]any{"items": items})
+	return s.AppendProvisioned(provision(EntryTodos, "", "", nil, map[string]any{"items": items}))
 }
 
 func (s *InMemorySession) AppendApprovalAlways(toolName string) (Entry, error) {
-	s.alwaysAllow[toolName] = true
-	return s.append(EntryApprovalAlways, "", toolName, nil, map[string]any{"tool": toolName})
+	return s.AppendProvisioned(provision(EntryApprovalAlways, "", toolName, nil, map[string]any{"tool": toolName}))
+}
+
+func (s *InMemorySession) AppendModelChange(model string) (Entry, error) {
+	return s.AppendProvisioned(provision(EntryModelChange, "", model, nil, map[string]any{"model": model}))
+}
+
+func (s *InMemorySession) AppendThinkingLevelChange(level string) (Entry, error) {
+	return s.AppendProvisioned(provision(EntryThinkingLevelChange, "", level, nil, map[string]any{"level": level}))
+}
+
+func (s *InMemorySession) AppendActiveToolsChange(names []string) (Entry, error) {
+	return s.AppendProvisioned(provision(EntryActiveToolsChange, "", "", nil, map[string]any{"tools": names}))
 }
 
 func (s *InMemorySession) BuildContext() ([]openai.ChatCompletionMessage, error) {
@@ -255,6 +411,12 @@ func (s *InMemorySession) BuildContext() ([]openai.ChatCompletionMessage, error)
 // whole log with LoadEntry and then call RebuildContext, which applies the
 // derived context in the right order.
 func (s *InMemorySession) LoadEntry(e Entry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadEntryLocked(e)
+}
+
+func (s *InMemorySession) loadEntryLocked(e Entry) {
 	RehydrateEntry(&e)
 	s.entries = append(s.entries, e)
 	s.parentID = e.ID
@@ -273,6 +435,8 @@ func (s *InMemorySession) LoadEntry(e Entry) {
 
 // ReplayEntry reapplies a persisted entry onto ctxMgr / session state without re-appending.
 func (s *InMemorySession) ReplayEntry(e Entry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	RehydrateEntry(&e)
 	switch e.Kind {
 	case EntryUserMessage:

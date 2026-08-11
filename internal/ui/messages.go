@@ -3,6 +3,7 @@ package ui
 import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness"
+	"github.com/Vignesh-Rajarajan/golum/pkg/harness/session"
 )
 
 type AgentEventMsg struct {
@@ -18,6 +19,13 @@ type ErrorMsg struct {
 type InputSubmitMsg struct {
 	Text string
 }
+
+type SteerQueuedMsg struct {
+	Entry session.ProvisionedEntry
+	Err   error
+}
+
+type ResumeRunDoneMsg struct{ Err error }
 
 type agentEventReader struct {
 	events <-chan harness.AgentEvent

@@ -10,12 +10,12 @@ import (
 type EventType int
 
 const (
-	EventTypeContentDelta EventType = iota // Incremental content chunk
-	EventTypeContentStart                  // Content generation started
-	EventTypeContentDone                   // Content generation completed
-	EventTypeToolCall                      // Tool/function call (complete, after accumulation)
-	EventTypeError                         // Error occurred
-	EventTypeThinkingDelta                 // Reasoning/thinking chunk (not persisted to context)
+	EventTypeContentDelta  EventType = iota // Incremental content chunk
+	EventTypeContentStart                   // Content generation started
+	EventTypeContentDone                    // Content generation completed
+	EventTypeToolCall                       // Tool/function call (complete, after accumulation)
+	EventTypeError                          // Error occurred
+	EventTypeThinkingDelta                  // Reasoning/thinking chunk (not persisted to context)
 )
 
 // StreamEvent represents a single event in the stream
@@ -58,6 +58,7 @@ func (t *ToolCall) ToOpenAI() openai.ToolCall {
 
 // ChatCompletionOptions configures the chat completion behavior
 type ChatCompletionOptions struct {
+	Model      string                 // Per-request model override
 	Stream     bool                   // Enable streaming response (default: true)
 	Tools      []Tool                 // Available tools/functions for the LLM
 	MaxRetries int                    // Maximum number of retries on rate limit/connection errors

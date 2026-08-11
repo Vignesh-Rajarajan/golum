@@ -63,6 +63,8 @@ type Model struct {
 	suggestIdx            int
 	lastInputValue        string
 	viewportBase          int
+	queued                []session.ProvisionedEntry
+	templates             []prompt.Template
 }
 
 type selectionPos struct {
@@ -130,8 +132,9 @@ func NewModel(cfg *config.Config, opts Options) Model {
 	// Procedural memory: project conventions the prompt has always claimed to
 	// follow (AGENTS.md) plus cross-project user instructions.
 	promptCfg := prompt.PromptConfig{CWD: cwd}
-	if skills, err := skill.LoadSkills(context.Background(), env); err == nil && len(skills) > 0 {
-		promptCfg.SkillsSection = skill.FormatSkillsSection(skills)
+	loadedSkills, _ := skill.LoadSkills(context.Background(), env)
+	if len(loadedSkills) > 0 {
+		promptCfg.SkillsSection = skill.FormatSkillsSection(loadedSkills)
 	}
 	if dev, err := memory.LoadProjectInstructions(cwd); err == nil && dev != "" {
 		promptCfg.DeveloperInstructions = dev
@@ -177,6 +180,7 @@ func NewModel(cfg *config.Config, opts Options) Model {
 		Approvals: broker,
 		Memory:    memStore,
 		PromptCfg: promptCfg,
+		Skills:    loadedSkills,
 	})
 	if err != nil {
 		applog.Printf("ui: harness: %v", err)
@@ -196,6 +200,15 @@ func NewModel(cfg *config.Config, opts Options) Model {
 		spinner:   sp,
 		viewport:  vp,
 		ctx:       context.Background(),
+	}
+	m.templates, _ = prompt.LoadTemplates(context.Background(), env)
+	if h != nil {
+		if open, openErr := sess.FindOpenOperations("main", 2); openErr == nil && len(open) == 1 {
+			m.messages = append(m.messages, Message{
+				Role:    RoleSystem,
+				Content: "A suspended operation was recovered. Use /resume-run to continue it or /abort-run to discard it.",
+			})
+		}
 	}
 	return m
 }
@@ -523,9 +536,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if key.Code == tea.KeyEnter {
-			if !m.streaming && m.input.Value() != "" {
+			if m.input.Value() != "" {
 				text := strings.TrimSpace(m.input.Value())
 				m.input.SetValue("")
+				if m.streaming {
+					if m.harness == nil {
+						m.messages = append(m.messages, Message{
+							Role: RoleError, Content: "Harness is not initialized.",
+						})
+						return m, nil
+					}
+					if strings.HasPrefix(text, "/") {
+						return m, m.sendMessage(text)
+					}
+					h := m.harness
+					ctx := m.ctx
+					return m, func() tea.Msg {
+						entry, err := h.Steer(ctx, text)
+						return SteerQueuedMsg{Entry: entry, Err: err}
+					}
+				}
 				return m, m.sendMessage(text)
 			}
 		}
@@ -544,6 +574,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncViewportContent()
 		m.viewport.GotoBottom()
 		return m, m.startAgent(msg.Text)
+
+	case SteerQueuedMsg:
+		if msg.Err != nil {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: msg.Err.Error()})
+		} else {
+			m.queued = append(m.queued, msg.Entry)
+		}
+		m.syncViewportContent()
+		return m, nil
+
+	case ResumeRunDoneMsg:
+		m.streaming = false
+		if msg.Err != nil {
+			m.messages = append(m.messages, Message{Role: RoleError, Content: msg.Err.Error()})
+		} else {
+			m.messages = append(m.messages, Message{Role: RoleSystem, Content: "Suspended operation completed."})
+		}
+		m.syncViewportContent()
+		return m, nil
 
 	case SessionsLoadedMsg:
 		m.picker.loading = false
@@ -665,7 +714,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() tea.View {
 	if !m.ready {
-		return tea.NewView("Loading...")
+		return tea.NewView("")
 	}
 
 	if m.width < 20 || m.height < 10 {
@@ -743,6 +792,12 @@ func (m Model) View() tea.View {
 	if showSuggestions {
 		b.WriteString(m.renderSuggestions(suggestions, m.width-2))
 		b.WriteString("\n\n")
+	}
+	if len(m.queued) > 0 {
+		for _, item := range m.queued {
+			fmt.Fprintf(&b, "queued steer: %s  (/cancel %s)\n", truncateRunes(item.Content, 72), item.ID)
+		}
+		b.WriteString("\n")
 	}
 
 	inputY := countLines(b.String()) - 1
@@ -1294,6 +1349,15 @@ func (m *Model) handleAgentEvent(ev harness.AgentEvent) {
 			m.messages = append(m.messages, Message{Role: RoleAssistant, Content: ev.Content})
 		}
 		m.viewport.GotoBottom()
+	case harness.EventQueueConsumed:
+		entryID := ev.Meta["entry_id"]
+		queued := m.queued[:0]
+		for _, item := range m.queued {
+			if item.ID != entryID {
+				queued = append(queued, item)
+			}
+		}
+		m.queued = queued
 	case harness.EventThinkingDelta:
 		collapsed := !m.thinkingExpanded
 		if len(m.messages) > 0 && m.messages[len(m.messages)-1].Role == RoleThinking {
@@ -1411,6 +1475,7 @@ func (m *Model) startNewSession() {
 		// rest of the run.
 		Memory:    m.memory,
 		PromptCfg: m.promptCfg,
+		Skills:    m.harness.Skills(),
 	})
 	if err != nil {
 		applog.Printf("ui: new harness: %v", err)
@@ -1443,7 +1508,7 @@ func (m Model) sessionFooterHint() string {
 	if cm == nil {
 		return ""
 	}
-	tu := cm.TotalUsage
+	tu := cm.TotalUsage()
 	var b strings.Builder
 	if tu.TotalTokens > 0 {
 		fmt.Fprintf(&b, "session Σ %d tok", tu.TotalTokens)

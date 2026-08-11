@@ -44,6 +44,20 @@ type JsonlSession struct {
 	path string
 }
 
+func (s *JsonlSession) AppendProvisioned(p ProvisionedEntry) (Entry, error) {
+	if existing, ok := s.GetEntry(p.ID); ok {
+		if !p.Matches(existing) {
+			return Entry{}, &ProvisionedEntryMismatchError{ID: p.ID}
+		}
+		return existing, nil
+	}
+	e, err := s.InMemorySession.AppendProvisioned(p)
+	if err != nil {
+		return e, err
+	}
+	return e, s.persist(e)
+}
+
 // Append helpers override to also persist.
 func (s *JsonlSession) AppendUserMessage(content string) (Entry, error) {
 	e, err := s.InMemorySession.AppendUserMessage(content)
@@ -110,6 +124,18 @@ func (s *JsonlSession) AppendApprovalAlways(toolName string) (Entry, error) {
 		return e, err
 	}
 	return e, s.persist(e)
+}
+
+func (s *JsonlSession) AppendModelChange(model string) (Entry, error) {
+	return s.AppendProvisioned(provision(EntryModelChange, "", model, nil, map[string]any{"model": model}))
+}
+
+func (s *JsonlSession) AppendThinkingLevelChange(level string) (Entry, error) {
+	return s.AppendProvisioned(provision(EntryThinkingLevelChange, "", level, nil, map[string]any{"level": level}))
+}
+
+func (s *JsonlSession) AppendActiveToolsChange(names []string) (Entry, error) {
+	return s.AppendProvisioned(provision(EntryActiveToolsChange, "", "", nil, map[string]any{"tools": names}))
 }
 
 func (s *JsonlSession) persist(e Entry) error {

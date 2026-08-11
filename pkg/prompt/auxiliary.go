@@ -2,6 +2,21 @@ package prompt
 
 import "fmt"
 
+const (
+	BRANCH_SUMMARY_PREFIX     = "<branch_summary>\n"
+	BRANCH_SUMMARY_SUFFIX     = "\n</branch_summary>"
+	COMPACTION_SUMMARY_PREFIX = "<compaction_summary>\n"
+	COMPACTION_SUMMARY_SUFFIX = "\n</compaction_summary>"
+)
+
+func WrapBranchSummary(summary string) string {
+	return BRANCH_SUMMARY_PREFIX + summary + BRANCH_SUMMARY_SUFFIX
+}
+
+func WrapCompactionSummary(summary string) string {
+	return COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX
+}
+
 // GetCompressionPrompt returns the handoff prompt for context compression / new sessions.
 func GetCompressionPrompt() string {
 	return `Provide a detailed continuation prompt for resuming this work. The new session will NOT have access to our conversation history.

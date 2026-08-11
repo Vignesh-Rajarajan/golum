@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"sort"
 	"sync"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
@@ -15,6 +16,15 @@ type AgentTool interface {
 	Parameters() map[string]any
 	Execute(ctx context.Context, args map[string]any, env execenv.ExecutionEnv) (Result, error)
 }
+
+type ReplayPolicy string
+
+const (
+	ReplayNever ReplayPolicy = "never"
+	ReplaySafe  ReplayPolicy = "safe"
+)
+
+type ReplayAware interface{ Replay() ReplayPolicy }
 
 // Result is what the model sees (and what the UI renders for that tool turn).
 type Result struct {
@@ -49,8 +59,7 @@ func (r *Registry) Get(name string) (AgentTool, bool) {
 	return t, ok
 }
 
-// Names returns registered tool names in stable sorted order? Insertion order via map is unstable;
-// return unsorted list — callers that need order should sort.
+// Names returns registered tool names in stable sorted order.
 func (r *Registry) Names() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -58,6 +67,7 @@ func (r *Registry) Names() []string {
 	for name := range r.tools {
 		out = append(out, name)
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -76,6 +86,7 @@ func (r *Registry) AsLLMTools() []llm.Tool {
 			},
 		})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Function.Name < out[j].Function.Name })
 	return out
 }
 
