@@ -3,19 +3,14 @@
 package evals
 
 import (
-	"fmt"
 	"os"
 	"testing"
 )
 
 func TestMain(m *testing.M) {
 	code := m.Run()
-	reports := SnapshotLifts()
-	if len(reports) > 0 {
-		fmt.Fprintln(os.Stderr, "\n=== eval lift reports ===")
-		for _, r := range reports {
-			fmt.Fprint(os.Stderr, r.String())
-		}
-	}
+	// The hand-written suites in this package predate the dataset, so they
+	// carry no dataset version of their own.
+	FlushReport("", os.Getenv)
 	os.Exit(code)
 }

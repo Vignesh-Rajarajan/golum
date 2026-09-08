@@ -1,0 +1,10 @@
+{
+  "service_name": "golum-eval",
+  "timeout_seconds": 30,
+  "max_retries": 3,
+  "log_level": "info",
+  "features": {
+    "tracing": false,
+    "cache": true
+  }
+}

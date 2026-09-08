@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,15 +55,32 @@ type Usage struct {
 
 // Result is the outcome of Harness.Run.
 type Result struct {
-	Output    string
-	Events    []TranscriptEvent
-	Entries   []session.Entry
-	Usage     Usage
-	Elapsed   time.Duration
-	RunID     string
-	Workspace string
-	Harness   string
-	Input     string
+	Output  string
+	Events  []TranscriptEvent
+	Entries []session.Entry
+	// Records are the session's orchestration records (step attempts, tool
+	// starts, usage, operation outcomes). They carry model-request counts,
+	// stop reasons, and guardrail codes that the simplified Events cannot.
+	Records []session.Record
+	Usage   Usage
+	Elapsed time.Duration
+	// TimeToFirstToken is measured from the start of the first prompt step to
+	// the first content, thinking, or tool-call event. Zero when nothing
+	// streamed back.
+	TimeToFirstToken time.Duration
+	RunID            string
+	Workspace        string
+	// SnapshotDir holds per-tool-call workspace snapshots when
+	// Options.SnapshotWorkspace is set; empty otherwise.
+	SnapshotDir string
+	Harness     string
+	Input       string
+	// Violations are approval denials and sandbox refusals observed during the
+	// run.
+	Violations []PolicyViolation
+
+	trajOnce sync.Once
+	traj     []TrajectoryStep
 }
 
 // Options configures an eval harness adapter.
@@ -73,6 +91,12 @@ type Options struct {
 	Skills                []skill.Skill
 	TransformSystemPrompt func(defaultPrompt string) string
 	Loop                  harness.LoopConfig // zero fields → eval defaults
+	// Approvals gates mutating tool calls. Nil approves everything.
+	Approvals ApprovalPolicy
+	// SnapshotWorkspace copies the workspace tree after every tool result so
+	// ReplayFrom can restore filesystem state at a trajectory cut. Off by
+	// default: it is only needed for prefix replay.
+	SnapshotWorkspace bool
 }
 
 // Harness adapts golum's AgentHarness for behavioral evals.
@@ -96,7 +120,6 @@ func (h *Harness) Run(ctx context.Context, t *testing.T, steps ...Step) (*Result
 		return nil, fmt.Errorf("evals: no steps")
 	}
 
-	start := time.Now()
 	runID := uuid.NewString()
 	workspace := t.TempDir()
 
@@ -108,6 +131,23 @@ func (h *Harness) Run(ctx context.Context, t *testing.T, steps ...Step) (*Result
 		return nil, err
 	}
 
+	return h.run(ctx, t, runID, workspace, env, nil, steps)
+}
+
+// run drives steps against an already-provisioned workspace. seed, when
+// non-nil, is a pre-existing session whose entries are replayed before the
+// first step (the prefix-replay path).
+func (h *Harness) run(
+	ctx context.Context,
+	t *testing.T,
+	runID, workspace string,
+	env execenv.ExecutionEnv,
+	seed []session.Entry,
+	steps []Step,
+) (*Result, error) {
+	t.Helper()
+	start := time.Now()
+
 	model, err := ResolveModel(h.opts.Model, os.Getenv)
 	if err != nil {
 		return nil, err
@@ -116,51 +156,87 @@ func (h *Harness) Run(ctx context.Context, t *testing.T, steps ...Step) (*Result
 	client := llm.NewClient(cfg)
 	reg, todos := buildRegistry(h.opts.ActiveTools)
 	loop := mergeEvalLoop(h.opts.Loop)
+	approvals := NewRecordingApprovals(h.opts.Approvals)
 
-	ah, sess, err := h.buildAgent(ctx, cfg, client, env, reg, todos, loop, nil)
+	snapshots := ""
+	if h.opts.SnapshotWorkspace {
+		if snapshots, err = prepareSnapshotDir(runID); err != nil {
+			return nil, err
+		}
+		if err := SnapshotWorkspaceAt(workspace, snapshots, initialSnapshot); err != nil {
+			return nil, err
+		}
+	}
+
+	ah, sess, err := h.buildAgent(ctx, cfg, client, env, reg, todos, loop, approvals, nil)
 	if err != nil {
 		return nil, err
 	}
+	if len(seed) > 0 {
+		if sess, err = replaySeed(sess, seed); err != nil {
+			return nil, err
+		}
+		if ah, sess, err = h.buildAgent(ctx, cfg, client, env, reg, todos, loop, approvals, sess); err != nil {
+			return nil, err
+		}
+	}
 
 	result := &Result{
-		RunID:     runID,
-		Workspace: workspace,
-		Harness:   h.Name,
-		Usage:     Usage{Model: model},
+		RunID:       runID,
+		Workspace:   workspace,
+		SnapshotDir: snapshots,
+		Harness:     h.Name,
+		Usage:       Usage{Model: model},
 	}
 	var accumulated contextmgr.TokenUsage
+	var records []session.Record
 	var inputs []string
 	var output strings.Builder
 	var events []TranscriptEvent
 	toolCalls := 0
 
+	// finish populates the fields every exit path needs, so an error return
+	// still yields a partial Result worth scoring and attributing.
+	finish := func() {
+		result.Events = events
+		result.Entries = sess.Entries()
+		result.Records = appendRecords(records, sess)
+		result.Violations = approvals.Violations(result.Entries)
+		result.Elapsed = time.Since(start)
+	}
+
 	for _, step := range steps {
 		switch step.Kind {
 		case "prompt":
 			inputs = append(inputs, step.Content)
-			out, evs, nTools, err := drainPrompt(ctx, ah, step.Content)
+			out, err := drainPrompt(ctx, ah, step.Content, promptHooks{
+				workspace:   workspace,
+				snapshotDir: snapshots,
+			})
+			events = append(events, out.Events...)
+			toolCalls += out.ToolCalls
+			if result.TimeToFirstToken == 0 && !out.FirstTokenAt.IsZero() {
+				result.TimeToFirstToken = out.FirstTokenAt.Sub(start)
+			}
 			if err != nil {
-				result.Events = events
-				result.Entries = sess.Entries()
-				result.Elapsed = time.Since(start)
+				finish()
 				return result, err
 			}
-			if output.Len() > 0 && out != "" {
+			if output.Len() > 0 && out.Output != "" {
 				output.WriteString("\n")
 			}
-			output.WriteString(out)
-			events = append(events, evs...)
-			toolCalls += nTools
-			if out != "" {
-				events = append(events, TranscriptEvent{Kind: "message", Role: "assistant", Content: out})
+			output.WriteString(out.Output)
+			if out.Output != "" {
+				events = append(events, TranscriptEvent{Kind: "message", Role: "assistant", Content: out.Output})
 			}
 		case "reload":
+			// A reload builds a fresh session, so records recorded against the
+			// old one have to be harvested before it is dropped.
 			accumulated.Add(sess.ContextManager().TotalUsage())
-			ah, sess, err = h.reload(ctx, cfg, client, env, reg, todos, loop, sess)
+			records = appendRecords(records, sess)
+			ah, sess, err = h.reload(ctx, cfg, client, env, reg, todos, loop, approvals, sess)
 			if err != nil {
-				result.Events = events
-				result.Entries = sess.Entries()
-				result.Elapsed = time.Since(start)
+				finish()
 				return result, err
 			}
 		default:
@@ -168,13 +244,10 @@ func (h *Harness) Run(ctx context.Context, t *testing.T, steps ...Step) (*Result
 		}
 	}
 
-	usage := sess.ContextManager().TotalUsage()
-	accumulated.Add(usage)
+	accumulated.Add(sess.ContextManager().TotalUsage())
 	result.Output = strings.TrimSpace(output.String())
-	result.Events = events
-	result.Entries = sess.Entries()
 	result.Input = strings.Join(inputs, "\n---\n")
-	result.Elapsed = time.Since(start)
+	finish()
 	result.Usage = Usage{
 		Model:        model,
 		InputTokens:  accumulated.PromptTokens,
@@ -185,6 +258,14 @@ func (h *Harness) Run(ctx context.Context, t *testing.T, steps ...Step) (*Result
 	return result, nil
 }
 
+func appendRecords(dst []session.Record, sess session.Session) []session.Record {
+	recs, err := sess.FindRecords(session.RecordQuery{Lane: "main"})
+	if err != nil {
+		return dst
+	}
+	return append(dst, recs...)
+}
+
 func (h *Harness) buildAgent(
 	ctx context.Context,
 	cfg *config.Config,
@@ -193,6 +274,7 @@ func (h *Harness) buildAgent(
 	reg *tool.Registry,
 	todos *tool.TodoStore,
 	loop harness.LoopConfig,
+	approvals harness.ApprovalBroker,
 	existing session.Session,
 ) (*harness.AgentHarness, session.Session, error) {
 	skills, _ := skill.LoadSkills(ctx, env)
@@ -233,7 +315,7 @@ func (h *Harness) buildAgent(
 		Registry:  reg,
 		Todos:     todos,
 		Session:   sess,
-		Approvals: harness.AutoApprove{},
+		Approvals: approvals,
 		Hooks:     hm,
 		Loop:      loop,
 		PromptCfg: promptCfg,
@@ -253,6 +335,7 @@ func (h *Harness) reload(
 	reg *tool.Registry,
 	todos *tool.TodoStore,
 	loop harness.LoopConfig,
+	approvals harness.ApprovalBroker,
 	old session.Session,
 ) (*harness.AgentHarness, session.Session, error) {
 	skills, _ := skill.LoadSkills(ctx, env)
@@ -269,24 +352,65 @@ func (h *Harness) reload(
 	if err := newSess.RebuildContext(); err != nil {
 		return nil, nil, fmt.Errorf("evals reload: rebuild context: %w", err)
 	}
-	return h.buildAgent(ctx, cfg, client, env, reg, todos, loop, newSess)
+	return h.buildAgent(ctx, cfg, client, env, reg, todos, loop, approvals, newSess)
 }
 
-func drainPrompt(ctx context.Context, ah *harness.AgentHarness, content string) (string, []TranscriptEvent, int, error) {
+// replaySeed loads a recorded entry prefix into sess and rebuilds the derived
+// context from it, so a run can continue from a trajectory cut.
+func replaySeed(sess session.Session, seed []session.Entry) (session.Session, error) {
+	loader, ok := sess.(*session.InMemorySession)
+	if !ok {
+		return nil, fmt.Errorf("evals: session %T cannot load a replay prefix", sess)
+	}
+	for _, e := range seed {
+		loader.LoadEntry(e)
+	}
+	if err := loader.RebuildContext(); err != nil {
+		return nil, fmt.Errorf("evals replay: rebuild context: %w", err)
+	}
+	return loader, nil
+}
+
+// promptHooks carries the per-step side effects drainPrompt performs while
+// streaming (currently workspace snapshotting for prefix replay).
+type promptHooks struct {
+	workspace   string
+	snapshotDir string
+}
+
+// promptOutcome is one prompt step's contribution to a Result.
+type promptOutcome struct {
+	Output       string
+	Events       []TranscriptEvent
+	ToolCalls    int
+	FirstTokenAt time.Time
+}
+
+func drainPrompt(ctx context.Context, ah *harness.AgentHarness, content string, hooks promptHooks) (promptOutcome, error) {
+	var outcome promptOutcome
 	ch, err := ah.Prompt(ctx, content)
 	if err != nil {
-		return "", nil, 0, err
+		return outcome, err
 	}
 	var out strings.Builder
 	var events []TranscriptEvent
 	toolCalls := 0
 	var lastErr error
 	var pendingName string
+	markFirstToken := func() {
+		if outcome.FirstTokenAt.IsZero() {
+			outcome.FirstTokenAt = time.Now()
+		}
+	}
 	for ev := range ch {
 		switch ev.Type {
 		case harness.EventContentDelta:
+			markFirstToken()
 			out.WriteString(ev.Content)
+		case harness.EventThinkingDelta:
+			markFirstToken()
 		case harness.EventToolCallStart:
+			markFirstToken()
 			toolCalls++
 			name, id := "", ""
 			var args map[string]any
@@ -323,6 +447,14 @@ func drainPrompt(ctx context.Context, ah *harness.AgentHarness, content string) 
 				Content:    content,
 				IsError:    isErr,
 			})
+			// Snapshot after the effect has landed, keyed by tool call id:
+			// that is the only identifier available both here and on the
+			// persisted tool-result entry ReplayFrom searches.
+			if hooks.snapshotDir != "" && id != "" {
+				if err := SnapshotWorkspaceAt(hooks.workspace, hooks.snapshotDir, id); err != nil {
+					lastErr = err
+				}
+			}
 		case harness.EventError:
 			if ev.Err != nil {
 				lastErr = ev.Err
@@ -333,10 +465,10 @@ func drainPrompt(ctx context.Context, ah *harness.AgentHarness, content string) 
 			// channel will close after this
 		}
 	}
-	if lastErr != nil {
-		return strings.TrimSpace(out.String()), events, toolCalls, lastErr
-	}
-	return strings.TrimSpace(out.String()), events, toolCalls, nil
+	outcome.Output = strings.TrimSpace(out.String())
+	outcome.Events = events
+	outcome.ToolCalls = toolCalls
+	return outcome, lastErr
 }
 
 func buildConfig(model string) *config.Config {

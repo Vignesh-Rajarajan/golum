@@ -43,6 +43,7 @@ Thumbs.db
 /bin/
 /dist/
 
-# Behavioral eval artifacts (pkg/evals)
+# Behavioral eval artifacts (pkg/evals and the dataset suite runner)
 pkg/evals/.eval/
+pkg/evals/suite/.eval/
 
