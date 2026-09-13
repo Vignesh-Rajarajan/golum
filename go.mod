@@ -10,7 +10,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/lucasb-eyer/go-colorful v1.3.0
-	github.com/mattn/go-runewidth v0.0.20
+	github.com/mattn/go-runewidth v0.0.30
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/rivo/uniseg v0.4.7
 	github.com/sashabaranov/go-openai v1.36.0
