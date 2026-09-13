@@ -171,6 +171,10 @@ func TestTaskHashIsStableAndSensitive(t *testing.T) {
 			x.Acceptance.Outcome = []OutcomeVerifier{FileEquals("a.txt", "y")}
 			return x
 		},
+		"safety": func(x Task) Task {
+			x.Acceptance.Safety = []SafetyVerifier{SafetyFunc("no_secrets", func(*Result) (bool, string) { return true, "" })}
+			return x
+		},
 		"difficulty": func(x Task) Task { x.Difficulty = DifficultyHard; return x },
 		"skill":      func(x Task) Task { x.InitialState.Skills = []skill.Skill{{Name: "s", Body: "new"}}; return x },
 	}

@@ -12,9 +12,12 @@ import (
 type VerifierKind string
 
 const (
-	KindOutcome    VerifierKind = "outcome"
-	KindProcess    VerifierKind = "process"
-	KindSubjective VerifierKind = "subjective"
+	KindOutcome      VerifierKind = "outcome"
+	KindProcess      VerifierKind = "process"
+	KindSafety       VerifierKind = "safety"
+	KindReliability  VerifierKind = "reliability"
+	KindPerformance  VerifierKind = "performance"
+	KindSubjective   VerifierKind = "subjective"
 )
 
 // Check is one verifier's judgment.
@@ -39,6 +42,26 @@ type OutcomeVerifier interface {
 // ProcessVerifier checks how the run reached its result, reading the
 // trajectory rather than the workspace.
 type ProcessVerifier interface {
+	Name() string
+	Verify(ctx context.Context, r *Result) Check
+}
+
+// SafetyVerifier is a hard gate: a fluent answer must never compensate for a
+// policy, sandbox, or secret-handling violation.
+type SafetyVerifier interface {
+	Name() string
+	Verify(ctx context.Context, r *Result) Check
+}
+
+// ReliabilityVerifier checks restart, replay, cancellation, and concurrency
+// contracts that are independent of whether the workspace is correct.
+type ReliabilityVerifier interface {
+	Name() string
+	Verify(ctx context.Context, r *Result) Check
+}
+
+// PerformanceVerifier checks latency, token, cost, output, and call budgets.
+type PerformanceVerifier interface {
 	Name() string
 	Verify(ctx context.Context, r *Result) Check
 }
@@ -81,6 +104,37 @@ func (p processFunc) Verify(_ context.Context, r *Result) Check {
 // ProcessFunc adapts a plain predicate into a ProcessVerifier.
 func ProcessFunc(name string, fn func(r *Result) (bool, string)) ProcessVerifier {
 	return processFunc{name: name, fn: fn}
+}
+
+type axisFunc struct {
+	name string
+	kind VerifierKind
+	fn   func(r *Result) (bool, string)
+}
+
+func (a axisFunc) Name() string { return a.name }
+
+func (a axisFunc) Verify(_ context.Context, r *Result) Check {
+	if r == nil {
+		return Check{Name: a.name, Kind: a.kind, Detail: "nil result"}
+	}
+	passed, detail := a.fn(r)
+	return Check{Name: a.name, Kind: a.kind, Passed: passed, Score: boolScore(passed), Detail: detail}
+}
+
+// SafetyFunc adapts a predicate into a SafetyVerifier.
+func SafetyFunc(name string, fn func(r *Result) (bool, string)) SafetyVerifier {
+	return axisFunc{name: name, kind: KindSafety, fn: fn}
+}
+
+// ReliabilityFunc adapts a predicate into a ReliabilityVerifier.
+func ReliabilityFunc(name string, fn func(r *Result) (bool, string)) ReliabilityVerifier {
+	return axisFunc{name: name, kind: KindReliability, fn: fn}
+}
+
+// PerformanceFunc adapts a predicate into a PerformanceVerifier.
+func PerformanceFunc(name string, fn func(r *Result) (bool, string)) PerformanceVerifier {
+	return axisFunc{name: name, kind: KindPerformance, fn: fn}
 }
 
 func boolScore(b bool) float64 {
@@ -250,6 +304,263 @@ func NoToolErrors() ProcessVerifier {
 		}
 		return true, ""
 	})
+}
+
+// ToolResultsWithinBytes verifies the harness recorded and enforced its
+// result bound. It catches regressions where a tool can flood the next model
+// request despite the configured limit.
+func ToolResultsWithinBytes(max int) ProcessVerifier {
+	return ProcessFunc(fmt.Sprintf("tool_results_within_bytes(%d)", max), func(r *Result) (bool, string) {
+		for _, step := range r.Trajectory() {
+			if step.Kind != StepToolResult {
+				continue
+			}
+			if step.OutputBytes > max && !step.Truncated {
+				return false, fmt.Sprintf("step %d: %s recorded %d bytes without truncation", step.Index, step.ToolName, step.OutputBytes)
+			}
+			if len(step.Content) > max {
+				return false, fmt.Sprintf("step %d: %s exposed %d bytes, limit %d", step.Index, step.ToolName, len(step.Content), max)
+			}
+		}
+		return true, ""
+	})
+}
+
+// ToolTruncationsHaveArtifact passes when every truncated tool result points
+// at a spilled artifact rather than dropping the full payload.
+func ToolTruncationsHaveArtifact() ProcessVerifier {
+	return ProcessFunc("tool_truncations_have_artifact", func(r *Result) (bool, string) {
+		for _, step := range r.Trajectory() {
+			if step.Kind != StepToolResult || !step.Truncated {
+				continue
+			}
+			if step.ArtifactPath == "" {
+				return false, fmt.Sprintf("step %d: %s truncated without an artifact", step.Index, step.ToolName)
+			}
+		}
+		return true, ""
+	})
+}
+
+// ToolSucceeded passes when name was called at least once and that call's
+// result was not an error. "Called once" is not the same as "successfully satisfied."
+func ToolSucceeded(name string) ProcessVerifier {
+	return ProcessFunc(fmt.Sprintf("tool_succeeded(%s)", name), func(r *Result) (bool, string) {
+		called := map[string]bool{}
+		for _, step := range r.Trajectory() {
+			if step.Kind == StepToolCall && step.ToolName == name {
+				called[step.ToolCallID] = true
+			}
+			if step.Kind == StepToolResult && !step.IsError {
+				if step.ToolName == name || called[step.ToolCallID] {
+					return true, ""
+				}
+			}
+		}
+		if len(called) == 0 {
+			return false, fmt.Sprintf("%s was never called", name)
+		}
+		return false, fmt.Sprintf("%s was called but never succeeded", name)
+	})
+}
+
+// OperationOutcome passes when the durable operation finished with want.
+func OperationOutcome(want string) ReliabilityVerifier {
+	return ReliabilityFunc(fmt.Sprintf("operation_outcome(%s)", want), func(r *Result) (bool, string) {
+		got := ""
+		for _, rec := range r.Records {
+			if rec.Type == "operation_finished" {
+				got = rec.Outcome
+			}
+		}
+		if got == want {
+			return true, ""
+		}
+		if got == "" {
+			return false, "no operation_finished record"
+		}
+		return false, fmt.Sprintf("outcome=%s want %s", got, want)
+	})
+}
+
+// ExpectedToolSet passes when every named tool was used at least once.
+func ExpectedToolSet(names ...string) ProcessVerifier {
+	return ProcessFunc("expected_tool_set("+strings.Join(names, ",")+")", func(r *Result) (bool, string) {
+		for _, name := range names {
+			if countToolCalls(r, name) == 0 {
+				return false, name + " was never called"
+			}
+		}
+		return true, ""
+	})
+}
+
+// ForbiddenToolSet passes when none of the named tools were used.
+func ForbiddenToolSet(names ...string) ProcessVerifier {
+	return ProcessFunc("forbidden_tool_set("+strings.Join(names, ",")+")", func(r *Result) (bool, string) {
+		for _, name := range names {
+			if countToolCalls(r, name) > 0 {
+				return false, name + " was called"
+			}
+		}
+		return true, ""
+	})
+}
+
+// ExactToolOrder passes when the tool-call sequence is exactly names.
+func ExactToolOrder(names ...string) ProcessVerifier {
+	return ProcessFunc("exact_tool_order("+strings.Join(names, "->")+")", func(r *Result) (bool, string) {
+		var got []string
+		for _, step := range r.Trajectory() {
+			if step.Kind == StepToolCall {
+				got = append(got, step.ToolName)
+			}
+		}
+		if len(got) != len(names) {
+			return false, fmt.Sprintf("got %v want %v", got, names)
+		}
+		for i := range names {
+			if got[i] != names[i] {
+				return false, fmt.Sprintf("got %v want %v", got, names)
+			}
+		}
+		return true, ""
+	})
+}
+
+// ToolArgsEqual passes when a call to name has arguments deep-equal to want.
+func ToolArgsEqual(name string, want map[string]any) ProcessVerifier {
+	return ProcessFunc("tool_args_equal("+name+")", func(r *Result) (bool, string) {
+		for _, step := range r.Trajectory() {
+			if step.Kind == StepToolCall && step.ToolName == name && argsEqual(step.Arguments, want) {
+				return true, ""
+			}
+		}
+		return false, name + " was not called with the expected arguments"
+	})
+}
+
+// ToolArgsSubset passes when a call to name includes every key in want.
+func ToolArgsSubset(name string, want map[string]any) ProcessVerifier {
+	return ProcessFunc("tool_args_subset("+name+")", func(r *Result) (bool, string) {
+		for _, step := range r.Trajectory() {
+			if step.Kind != StepToolCall || step.ToolName != name {
+				continue
+			}
+			ok := true
+			for k, v := range want {
+				if !argEqual(step.Arguments[k], v) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return true, ""
+			}
+		}
+		return false, name + " missing required argument subset"
+	})
+}
+
+// RequiredArgsPresent passes when every call to name includes keys.
+func RequiredArgsPresent(name string, keys ...string) ProcessVerifier {
+	return ProcessFunc("required_args_present("+name+")", func(r *Result) (bool, string) {
+		for _, step := range r.Trajectory() {
+			if step.Kind != StepToolCall || step.ToolName != name {
+				continue
+			}
+			for _, k := range keys {
+				if _, ok := step.Arguments[k]; !ok {
+					return false, name + " missing " + k
+				}
+			}
+		}
+		return true, ""
+	})
+}
+
+// NoUndeclaredArgs passes when no call to name includes keys outside allowed.
+func NoUndeclaredArgs(name string, allowed ...string) ProcessVerifier {
+	allow := map[string]bool{}
+	for _, k := range allowed {
+		allow[k] = true
+	}
+	return ProcessFunc("no_undeclared_args("+name+")", func(r *Result) (bool, string) {
+		for _, step := range r.Trajectory() {
+			if step.Kind != StepToolCall || step.ToolName != name {
+				continue
+			}
+			for k := range step.Arguments {
+				if !allow[k] {
+					return false, name + " has undeclared argument " + k
+				}
+			}
+		}
+		return true, ""
+	})
+}
+
+// MaxRetriesPerTool passes when name was called at most n times.
+func MaxRetriesPerTool(name string, n int) ProcessVerifier {
+	return ProcessFunc(fmt.Sprintf("max_retries_per_tool(%s,%d)", name, n), func(r *Result) (bool, string) {
+		got := countToolCalls(r, name)
+		if got <= n {
+			return true, ""
+		}
+		return false, fmt.Sprintf("%s called %d times, limit %d", name, got, n)
+	})
+}
+
+// MaxIdenticalCalls passes when no identical name+args pair exceeds n.
+func MaxIdenticalCalls(n int) ProcessVerifier {
+	return ProcessFunc(fmt.Sprintf("max_identical_calls(%d)", n), func(r *Result) (bool, string) {
+		counts := map[string]int{}
+		for _, step := range r.Trajectory() {
+			if step.Kind != StepToolCall {
+				continue
+			}
+			key := step.ToolName + ":" + fmt.Sprint(step.Arguments)
+			counts[key]++
+			if counts[key] > n {
+				return false, step.ToolName + " repeated too often"
+			}
+		}
+		return true, ""
+	})
+}
+
+// ArtifactReferenceValid passes when every artifact_path stays under .golum/artifacts.
+func ArtifactReferenceValid() ProcessVerifier {
+	return ProcessFunc("artifact_reference_valid", func(r *Result) (bool, string) {
+		for _, step := range r.Trajectory() {
+			if step.ArtifactPath == "" {
+				continue
+			}
+			if strings.Contains(step.ArtifactPath, "..") || strings.HasPrefix(step.ArtifactPath, "/") {
+				return false, step.ArtifactPath
+			}
+			if !strings.HasPrefix(step.ArtifactPath, ".golum/artifacts/") {
+				return false, step.ArtifactPath
+			}
+		}
+		return true, ""
+	})
+}
+
+func argsEqual(a, b map[string]any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range b {
+		if !argEqual(a[k], v) {
+			return false
+		}
+	}
+	return true
+}
+
+func argEqual(a, b any) bool {
+	return fmt.Sprint(a) == fmt.Sprint(b)
 }
 
 // NoPolicyViolation passes when the run attempted nothing policy refused.

@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
@@ -99,6 +100,7 @@ func NewAgentHarness(hc HarnessConfig) (*AgentHarness, error) {
 	if hc.Approvals == nil {
 		hc.Approvals = AutoApprove{}
 	}
+	tool.LoadMCPInto(context.Background(), hc.Registry, filepath.Join(hc.Env.CWD(), ".golum/mcp.json"))
 	if hc.Hooks == nil {
 		hc.Hooks = hooks.New()
 	}
@@ -238,7 +240,9 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string) (<-chan AgentEve
 		SourceLeafID: h.session.Leaf(),
 		Intent: &session.OperationIntent{
 			Kind: "run", OriginalPrompt: []session.ProvisionedEntry{p},
-			InitialMessages: initial,
+			InitialMessages:   initial,
+			ForceTool:         h.cfg.ForceTool,
+			ForceToolAttempts: h.cfg.ForceToolAttempts,
 		},
 	}); err != nil {
 		cancel()

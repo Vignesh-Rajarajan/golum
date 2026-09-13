@@ -33,3 +33,19 @@ func NewClient(cfg *config.Config) *Client {
 		config: cfg,
 	}
 }
+
+// Provider is "openrouter" when that key is set, otherwise "openai".
+func (c *Client) Provider() string {
+	if c != nil && c.config != nil && c.config.OpenRouterAPIKey != "" {
+		return "openrouter"
+	}
+	return "openai"
+}
+
+// Model is the configured default model id.
+func (c *Client) Model() string {
+	if c != nil && c.config != nil {
+		return c.config.Model
+	}
+	return ""
+}

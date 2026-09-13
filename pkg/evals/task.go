@@ -10,6 +10,8 @@ import (
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness"
+	"github.com/Vignesh-Rajarajan/golum/pkg/harness/harnesstest"
+	"github.com/Vignesh-Rajarajan/golum/pkg/mcp"
 	"github.com/Vignesh-Rajarajan/golum/pkg/skill"
 )
 
@@ -135,19 +137,31 @@ type Environment struct {
 	TransformSystemPrompt func(defaultPrompt string) string
 	Approvals             ApprovalPolicy
 	SnapshotWorkspace     bool
+	ForceTool             string
+	MCPBackends           []mcp.Backend
+	// Script, when set, drives the run against a local OpenAI-compatible
+	// server so the task can run on every PR without a real model.
+	Script []harnesstest.Turn
 }
 
-// AcceptanceCriteria states what "done" means along three independent axes.
-// Keeping them apart is the point: a run can produce the right file by a
-// forbidden route, or follow a perfect process and still answer badly, and a
-// single blended score hides both.
+// AcceptanceCriteria states what "done" means along five independent
+// deterministic axes plus an informational quality axis.
+//
+// A fluent answer must never compensate for a policy violation. Subjective
+// judges never override any of the five gates.
 type AcceptanceCriteria struct {
 	// Outcome checks the world the run left behind. Authoritative.
 	Outcome []OutcomeVerifier
 	// Process checks how the run got there. Authoritative.
 	Process []ProcessVerifier
+	// Safety is a hard gate for approvals, sandbox boundaries, and secrets.
+	Safety []SafetyVerifier
+	// Reliability checks restart, replay, cancellation, and concurrency.
+	Reliability []ReliabilityVerifier
+	// Performance checks latency, token, cost, output, and call budgets.
+	Performance []PerformanceVerifier
 	// Subjective grades qualities no deterministic check can express. Never
-	// allowed to override Outcome or Process.
+	// allowed to override the five gates.
 	Subjective []Judge
 }
 
@@ -192,6 +206,9 @@ func (t Task) Validate() error {
 	}
 	if len(t.Acceptance.Outcome) == 0 &&
 		len(t.Acceptance.Process) == 0 &&
+		len(t.Acceptance.Safety) == 0 &&
+		len(t.Acceptance.Reliability) == 0 &&
+		len(t.Acceptance.Performance) == 0 &&
 		len(t.Acceptance.Subjective) == 0 {
 		return fmt.Errorf("evals: task %q has no acceptance criteria", t.ID)
 	}
@@ -223,7 +240,7 @@ func (t Task) Options() Options {
 	if name == "" {
 		name = t.ID
 	}
-	return Options{
+	opts := Options{
 		Name:                  name,
 		Model:                 t.Environment.Model,
 		ActiveTools:           t.Environment.ActiveTools,
@@ -232,7 +249,13 @@ func (t Task) Options() Options {
 		Loop:                  t.Environment.Loop,
 		Approvals:             t.Environment.Approvals,
 		SnapshotWorkspace:     t.Environment.SnapshotWorkspace,
+		MCPBackends:           t.Environment.MCPBackends,
+		Script:                t.Environment.Script,
 	}
+	if t.Environment.ForceTool != "" {
+		opts.Loop.ForceTool = t.Environment.ForceTool
+	}
+	return opts
 }
 
 // With returns a copy of the task running under env, for baseline-versus-

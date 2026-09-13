@@ -1,0 +1,9 @@
+{
+  "factual/capital-of-france": "78d8f2bbf0cd9ca6a8cfbcd0dc845e10",
+  "fs/edit-seeded-config": "61d17dda96bdea59e743f7062b4b2128",
+  "fs/forced-write": "b33c37b077695875aa305fd571cc22c5",
+  "fs/read-bounded-output": "d954edfa1399873f859c04e99acf3b7d",
+  "fs/write-read-roundtrip": "01d42513d8b59838075ec732888ae16b",
+  "mcp/invoke-echo": "f9efbb7ff7578e1cfe07b3578c3ea6ac",
+  "skills/eval-ritual": "6025b129f65516fb4e5e82e7b960d4f7"
+}

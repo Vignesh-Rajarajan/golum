@@ -28,6 +28,9 @@ func failedRun(r *Result, mutate func(*TaskRun)) *TaskRun {
 	}
 	run.Outcome = []Check{{Name: "file_equals(a.txt)", Kind: KindOutcome, Passed: false, Detail: "read a.txt: missing"}}
 	run.ProcessPassed = true
+	run.SafetyPassed = true
+	run.ReliabilityPassed = true
+	run.PerformancePassed = true
 	if mutate != nil {
 		mutate(run)
 	}
@@ -39,6 +42,7 @@ func TestAttributeFailureNilWhenDeterministicCriteriaHold(t *testing.T) {
 	run := &TaskRun{
 		Task: Task{ID: "t"}, Result: cleanResult(),
 		OutcomePassed: true, ProcessPassed: true,
+		SafetyPassed: true, ReliabilityPassed: true, PerformancePassed: true,
 	}
 	if got := AttributeFailure(run); got != nil {
 		t.Fatalf("a passing run should not be attributed, got %+v", got)
@@ -51,6 +55,7 @@ func TestAttributeFailureIgnoresSubjectiveFailure(t *testing.T) {
 	run := &TaskRun{
 		Task: Task{ID: "t"}, Result: cleanResult(),
 		OutcomePassed: true, ProcessPassed: true,
+		SafetyPassed: true, ReliabilityPassed: true, PerformancePassed: true,
 		Subjective:     []Check{{Name: "judge[0]", Kind: KindSubjective, Passed: false}},
 		ResponsePassed: false,
 	}

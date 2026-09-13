@@ -3,11 +3,22 @@ package evals
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
 	"github.com/google/uuid"
 )
+
+func buildID() string {
+	if v := os.Getenv("GITHUB_SHA"); v != "" {
+		return v
+	}
+	if v := os.Getenv("GOLUM_BUILD_ID"); v != "" {
+		return v
+	}
+	return ""
+}
 
 // TaskRun is one execution of a Task, scored on all three acceptance axes.
 // The axes stay separate all the way into the report: a run that wrote the
@@ -21,13 +32,19 @@ type TaskRun struct {
 	// here instead of being returned.
 	Err error
 
-	Outcome    []Check
-	Process    []Check
-	Subjective []Check
+	Outcome     []Check
+	Process     []Check
+	Safety      []Check
+	Reliability []Check
+	Performance []Check
+	Subjective  []Check
 
-	OutcomePassed  bool
-	ProcessPassed  bool
-	ResponsePassed bool
+	OutcomePassed      bool
+	ProcessPassed      bool
+	SafetyPassed       bool
+	ReliabilityPassed  bool
+	PerformancePassed  bool
+	ResponsePassed     bool
 
 	Metrics     Metrics
 	Attribution *Attribution
@@ -36,7 +53,10 @@ type TaskRun struct {
 // Passed reports whether every deterministic criterion held. Subjective
 // judges are excluded on purpose: they inform the report, they do not decide
 // it.
-func (r *TaskRun) Passed() bool { return r.OutcomePassed && r.ProcessPassed }
+func (r *TaskRun) Passed() bool {
+	return r.OutcomePassed && r.ProcessPassed && r.SafetyPassed &&
+		r.ReliabilityPassed && r.PerformancePassed
+}
 
 // HarnessFor builds the eval harness a task's environment describes.
 func HarnessFor(task Task) *Harness { return New(task.Options()) }
@@ -64,11 +84,18 @@ func RunTask(ctx context.Context, t *testing.T, task Task) (*TaskRun, error) {
 	if err := task.InitialState.Apply(ctx, env); err != nil {
 		return nil, err
 	}
+	initial, _ := workspaceManifest(ctx, env)
 
 	result, runErr := h.run(ctx, t, runID, workspace, env, nil, task.PromptSteps())
 	if result == nil {
 		return nil, fmt.Errorf("evals: task %q did not start: %w", task.ID, runErr)
 	}
+	result.DatasetVersion = task.Version
+	result.TaskHash = TaskHash(task)
+	result.Seed = SeedLabel()
+	result.BuildID = buildID()
+	result.InitialManifest = initial
+	result.FinalManifest, _ = workspaceManifest(ctx, env)
 	return Evaluate(ctx, task, result, runErr), nil
 }
 
@@ -96,10 +123,22 @@ func Evaluate(ctx context.Context, task Task, result *Result, runErr error) *Tas
 	for _, v := range task.Acceptance.Process {
 		run.Process = append(run.Process, v.Verify(ctx, result))
 	}
+	for _, v := range task.Acceptance.Safety {
+		run.Safety = append(run.Safety, v.Verify(ctx, result))
+	}
+	for _, v := range task.Acceptance.Reliability {
+		run.Reliability = append(run.Reliability, v.Verify(ctx, result))
+	}
+	for _, v := range task.Acceptance.Performance {
+		run.Performance = append(run.Performance, v.Verify(ctx, result))
+	}
 	run.Subjective = scoreSubjective(ctx, task.Acceptance.Subjective, result)
 
 	run.OutcomePassed = allPassed(run.Outcome)
 	run.ProcessPassed = allPassed(run.Process)
+	run.SafetyPassed = allPassed(run.Safety)
+	run.ReliabilityPassed = allPassed(run.Reliability)
+	run.PerformancePassed = allPassed(run.Performance)
 	run.ResponsePassed = allPassed(run.Subjective)
 	run.Attribution = AttributeFailure(run)
 	return run

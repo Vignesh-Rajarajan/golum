@@ -144,6 +144,9 @@ func TestProcessVerifiers(t *testing.T) {
 	if got := NoToolErrors().Verify(ctx, r); !got.Passed {
 		t.Fatalf("no tool failed: %+v", got)
 	}
+	if got := ToolResultsWithinBytes(2).Verify(ctx, r); !got.Passed {
+		t.Fatalf("short tool results should be bounded: %+v", got)
+	}
 	if got := NoPolicyViolation().Verify(ctx, r); !got.Passed {
 		t.Fatalf("no policy was violated: %+v", got)
 	}
@@ -157,6 +160,94 @@ func TestProcessVerifiers(t *testing.T) {
 	}
 	if !strings.Contains(reversed.Detail, "write_file") {
 		t.Fatalf("detail should name the tool it was still waiting for, got %q", reversed.Detail)
+	}
+}
+
+func TestToolResultsWithinBytesDetectsUnboundedResult(t *testing.T) {
+	r := &Result{Entries: []session.Entry{
+		{ID: "a", Kind: session.EntryAssistantMessage, Meta: map[string]any{"tool_calls": toolCalls("c", "shell")}},
+		{ID: "r", Kind: session.EntryToolResult, Content: "too long", Meta: map[string]any{
+			"tool_call_id": "c", "output_bytes": 8, "truncated": false,
+		}},
+	}}
+	got := ToolResultsWithinBytes(4).Verify(context.Background(), r)
+	if got.Passed || !strings.Contains(got.Detail, "without truncation") {
+		t.Fatalf("expected unbounded result failure, got %+v", got)
+	}
+}
+
+func TestToolResultsWithinBytesAllowsTruncatedPreview(t *testing.T) {
+	r := &Result{Entries: []session.Entry{
+		{ID: "a", Kind: session.EntryAssistantMessage, Meta: map[string]any{"tool_calls": toolCalls("c", "read_file")}},
+		{ID: "r", Kind: session.EntryToolResult, Content: "head...tail", Meta: map[string]any{
+			"tool_call_id": "c", "output_bytes": 80_000, "truncated": true,
+		}},
+	}}
+	got := ToolResultsWithinBytes(32).Verify(context.Background(), r)
+	if !got.Passed {
+		t.Fatalf("truncated preview within the bound should pass: %+v", got)
+	}
+}
+
+func TestToolTruncationsHaveArtifact(t *testing.T) {
+	missing := &Result{Entries: []session.Entry{
+		{ID: "a", Kind: session.EntryAssistantMessage, Meta: map[string]any{"tool_calls": toolCalls("c", "read_file")}},
+		{ID: "r", Kind: session.EntryToolResult, Content: "preview", Meta: map[string]any{
+			"tool_call_id": "c", "truncated": true,
+		}},
+	}}
+	if got := ToolTruncationsHaveArtifact().Verify(context.Background(), missing); got.Passed {
+		t.Fatal("expected missing artifact to fail")
+	}
+	ok := &Result{Entries: []session.Entry{
+		{ID: "a", Kind: session.EntryAssistantMessage, Meta: map[string]any{"tool_calls": toolCalls("c", "read_file")}},
+		{ID: "r", Kind: session.EntryToolResult, Content: "preview", Meta: map[string]any{
+			"tool_call_id": "c", "truncated": true, "artifact_path": ".golum/artifacts/c.txt",
+		}},
+	}}
+	if got := ToolTruncationsHaveArtifact().Verify(context.Background(), ok); !got.Passed {
+		t.Fatalf("expected a pass: %+v", got)
+	}
+}
+
+func TestSafetyFailureCannotBeLiftedByOutcomeOrJudge(t *testing.T) {
+	task := Task{
+		ID: "safe", Objective: "do it",
+		Acceptance: AcceptanceCriteria{
+			Outcome:    []OutcomeVerifier{FinalAnswerEquals("ok")},
+			Safety:     []SafetyVerifier{SafetyFunc("must_fail", func(*Result) (bool, string) { return false, "leaked" })},
+			Subjective: []Judge{Equals("ok")},
+		},
+	}
+	result := &Result{Output: "ok"}
+	run := Evaluate(context.Background(), task, result, nil)
+	if !run.OutcomePassed {
+		t.Fatal("outcome should pass")
+	}
+	if run.SafetyPassed || run.Passed() {
+		t.Fatal("a fluent answer must not lift a safety failure")
+	}
+	if run.Attribution == nil || run.Attribution.Kind != FailureSafety {
+		t.Fatalf("attribution=%+v", run.Attribution)
+	}
+}
+
+func TestEvaluateFailsWhenToolResultExceedsBound(t *testing.T) {
+	task := Task{
+		ID: "bound", Objective: "read it",
+		Acceptance: AcceptanceCriteria{
+			Process: []ProcessVerifier{ToolUsed("read_file"), ToolResultsWithinBytes(4)},
+		},
+	}
+	result := &Result{Entries: []session.Entry{
+		{ID: "a", Kind: session.EntryAssistantMessage, Meta: map[string]any{"tool_calls": toolCalls("c", "read_file")}},
+		{ID: "r", Kind: session.EntryToolResult, Content: "too long", Meta: map[string]any{
+			"tool_call_id": "c", "output_bytes": 8, "truncated": false,
+		}},
+	}}
+	run := Evaluate(context.Background(), task, result, nil)
+	if run.ProcessPassed {
+		t.Fatal("expected process failure for an unbounded tool result")
 	}
 }
 
@@ -188,6 +279,25 @@ func TestProcessVerifiersDetectFailures(t *testing.T) {
 	}
 	if got := NoPolicyViolation().Verify(context.Background(), r); got.Passed {
 		t.Fatal("a recorded violation should fail the check")
+	}
+}
+
+func TestNewProcessVerifiers(t *testing.T) {
+	r := processResult()
+	if got := ExpectedToolSet("write_file", "read_file").Verify(context.Background(), r); !got.Passed {
+		t.Fatalf("%+v", got)
+	}
+	if got := ForbiddenToolSet("shell").Verify(context.Background(), r); !got.Passed {
+		t.Fatalf("%+v", got)
+	}
+	if got := ExactToolOrder("write_file", "read_file").Verify(context.Background(), r); !got.Passed {
+		t.Fatalf("%+v", got)
+	}
+	if got := ToolSucceeded("write_file").Verify(context.Background(), r); !got.Passed {
+		t.Fatalf("%+v", got)
+	}
+	if got := ArtifactReferenceValid().Verify(context.Background(), r); !got.Passed {
+		t.Fatalf("%+v", got)
 	}
 }
 

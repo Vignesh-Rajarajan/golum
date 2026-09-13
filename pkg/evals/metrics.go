@@ -36,6 +36,8 @@ type Metrics struct {
 	GuardrailMessage string `json:"guardrail_message,omitempty"`
 	// Compactions counts context compactions, including overflow recoveries.
 	Compactions int `json:"compactions"`
+	// NativeToolCount is the number of tool schemas sent on model requests.
+	NativeToolCount int `json:"native_tool_count,omitempty"`
 }
 
 // ComputeMetrics derives run accounting from the durable records and the
@@ -53,6 +55,7 @@ func ComputeMetrics(r *Result) Metrics {
 		InputTokens:        r.Usage.InputTokens,
 		OutputTokens:       r.Usage.OutputTokens,
 		TotalTokens:        r.Usage.TotalTokens,
+		NativeToolCount:    r.NativeToolCount,
 	}
 
 	steps := r.Trajectory()

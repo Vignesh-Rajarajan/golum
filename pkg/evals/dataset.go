@@ -120,6 +120,15 @@ func TaskHash(task Task) string {
 	for _, v := range task.Acceptance.Process {
 		write("process", v.Name())
 	}
+	for _, v := range task.Acceptance.Safety {
+		write("safety", v.Name())
+	}
+	for _, v := range task.Acceptance.Reliability {
+		write("reliability", v.Name())
+	}
+	for _, v := range task.Acceptance.Performance {
+		write("performance", v.Name())
+	}
 	write("subjective", fmt.Sprint(len(task.Acceptance.Subjective)))
 	return hex.EncodeToString(h.Sum(nil)[:16])
 }

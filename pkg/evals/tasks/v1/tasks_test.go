@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/evals"
@@ -95,5 +96,25 @@ func TestRitualEnvironmentsShareATaskHash(t *testing.T) {
 	// Seeding the skill does change the initial state, and should be visible.
 	if withSkill := evals.TaskHash(WithRitualSkill(task)); withSkill == base {
 		t.Fatal("seeding the skill should change the task hash")
+	}
+}
+
+// The bounded-read task only measures the harness limit if the seed is larger
+// than that limit. A too-small blob would pass without ever truncating.
+func TestBoundedReadTaskExceedsItsLimit(t *testing.T) {
+	task, ok := Dataset().Get("fs/read-bounded-output")
+	if !ok {
+		t.Fatal("fs/read-bounded-output missing from the dataset")
+	}
+	limit := task.Environment.Loop.MaxToolResultBytes
+	if limit != boundedReadLimit {
+		t.Fatalf("task limit %d, want %d", limit, boundedReadLimit)
+	}
+	blob := task.InitialState.Files["blob.txt"]
+	if len(blob) <= limit {
+		t.Fatalf("seed is %d bytes, not larger than the %d-byte bound", len(blob), limit)
+	}
+	if !strings.HasPrefix(blob, "HEAD_MARK\n") || !strings.HasSuffix(blob, "TAIL_MARK\n") {
+		t.Fatal("seed must put the markers at the head and tail the truncated preview keeps")
 	}
 }

@@ -89,6 +89,27 @@ func TestTrajectoryShape(t *testing.T) {
 	}
 }
 
+func TestTrajectoryReadsOutputBounds(t *testing.T) {
+	r := &Result{Entries: []session.Entry{
+		{ID: "a", Kind: session.EntryAssistantMessage, Meta: map[string]any{
+			"tool_calls": []openai.ToolCall{{ID: "c", Function: openai.FunctionCall{Name: "read_file"}}},
+		}},
+		{ID: "r", Kind: session.EntryToolResult, Content: "preview", Meta: map[string]any{
+			// float64 is the shape JSON/sqlite round-trips integers into.
+			"tool_call_id": "c", "output_bytes": float64(9001), "truncated": true,
+			"artifact_path": ".golum/artifacts/c.txt",
+		}},
+	}}
+	steps := r.Trajectory()
+	if len(steps) != 3 {
+		t.Fatalf("got %d steps, want 3", len(steps))
+	}
+	got := steps[2]
+	if got.Kind != StepToolResult || got.OutputBytes != 9001 || !got.Truncated || got.ArtifactPath != ".golum/artifacts/c.txt" {
+		t.Fatalf("tool result = %+v", got)
+	}
+}
+
 func TestSafeCutIndexKeepsToolBatchesIntact(t *testing.T) {
 	steps := synthetic().Trajectory()
 

@@ -32,6 +32,12 @@ type TaskReport struct {
 	OutcomePassRate float64 `json:"outcome_pass_rate"`
 	// ProcessPassRate is "used an allowed process".
 	ProcessPassRate float64 `json:"process_pass_rate"`
+	// SafetyPassRate is "obeyed approvals, sandbox, and secret rules".
+	SafetyPassRate float64 `json:"safety_pass_rate"`
+	// ReliabilityPassRate is "restart, retry, cancel, replay behaved".
+	ReliabilityPassRate float64 `json:"reliability_pass_rate"`
+	// PerformancePassRate is "stayed within latency, token, cost, and call budgets".
+	PerformancePassRate float64 `json:"performance_pass_rate"`
 	// ResponsePassRate is "gave a good response", as graded by subjective
 	// judges. Informational: it never gates a pass.
 	ResponsePassRate float64 `json:"response_pass_rate"`
@@ -89,7 +95,7 @@ func SummarizeTask(runs []*TaskRun, k int) TaskReport {
 		report.Harness = first.Result.Harness
 	}
 
-	var outcomePasses, processPasses, responsePasses, passes int
+	var outcomePasses, processPasses, safetyPasses, reliabilityPasses, performancePasses, responsePasses, passes int
 	var subjectiveSum float64
 	var subjectiveCount int
 	var tokens, toolCalls, modelCalls float64
@@ -105,6 +111,15 @@ func SummarizeTask(runs []*TaskRun, k int) TaskReport {
 		}
 		if run.ProcessPassed {
 			processPasses++
+		}
+		if run.SafetyPassed {
+			safetyPasses++
+		}
+		if run.ReliabilityPassed {
+			reliabilityPasses++
+		}
+		if run.PerformancePassed {
+			performancePasses++
 		}
 		if run.ResponsePassed {
 			responsePasses++
@@ -139,6 +154,9 @@ func SummarizeTask(runs []*TaskRun, k int) TaskReport {
 	n := float64(len(runs))
 	report.OutcomePassRate = float64(outcomePasses) / n
 	report.ProcessPassRate = float64(processPasses) / n
+	report.SafetyPassRate = float64(safetyPasses) / n
+	report.ReliabilityPassRate = float64(reliabilityPasses) / n
+	report.PerformancePassRate = float64(performancePasses) / n
 	report.ResponsePassRate = float64(responsePasses) / n
 	report.PassRate = float64(passes) / n
 	if subjectiveCount > 0 {
@@ -213,18 +231,18 @@ func (r Report) Markdown() string {
 
 	if len(r.Tasks) > 0 {
 		b.WriteString("\n## Tasks\n\n")
-		b.WriteString("Outcome = produced the correct result. " +
-			"Process = used an allowed process. " +
-			"Response = judged a good answer (informational).\n\n")
-		b.WriteString("| Task | Diff | N | Outcome | Process | Response | pass@k | pass^k | Outcome 95% CI | p50 ms | Tokens | Tools |\n")
-		b.WriteString("|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+		b.WriteString("Outcome / Process / Safety / Reliability / Performance are independent gates. " +
+			"Response is judged and informational.\n\n")
+		b.WriteString("| Task | Diff | N | Outcome | Process | Safety | Rel | Perf | Response | pass@k | pass^k | p50 ms | Tokens |\n")
+		b.WriteString("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 		for _, task := range r.Tasks {
-			fmt.Fprintf(&b, "| %s | %s | %d | %.0f%% | %.0f%% | %.0f%% | %.2f | %.2f | %.0f–%.0f%% | %.0f | %.0f | %.1f |\n",
+			fmt.Fprintf(&b, "| %s | %s | %d | %.0f%% | %.0f%% | %.0f%% | %.0f%% | %.0f%% | %.0f%% | %.2f | %.2f | %.0f | %.0f |\n",
 				task.TaskID, task.Difficulty, task.N,
-				task.OutcomePassRate*100, task.ProcessPassRate*100, task.ResponsePassRate*100,
+				task.OutcomePassRate*100, task.ProcessPassRate*100,
+				task.SafetyPassRate*100, task.ReliabilityPassRate*100, task.PerformancePassRate*100,
+				task.ResponsePassRate*100,
 				task.PassAtK, task.PassPowerK,
-				task.OutcomeCI[0]*100, task.OutcomeCI[1]*100,
-				task.LatencyMs.P50, task.MeanTokens, task.MeanToolCalls)
+				task.LatencyMs.P50, task.MeanTokens)
 		}
 		for _, task := range r.Tasks {
 			if len(task.Attributions) == 0 && len(task.Warnings) == 0 && task.TotalCostUSD == nil {

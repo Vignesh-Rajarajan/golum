@@ -94,6 +94,13 @@ func TestValidateRecordLogCorruptionReasons(t *testing.T) {
 			}()}},
 		{"invalid deferred handle", CorruptionInvalidDeferredHandle, nil,
 			[]session.Record{started(1, "run"), rec(2, session.RecordWriteDeferred)}},
+		{"orphan tool result", CorruptionOrphanToolResult,
+			[]session.Entry{{ID: "r", Kind: session.EntryToolResult, Meta: map[string]any{"tool_call_id": "x"}}},
+			[]session.Record{started(1, "run")}},
+		{"invalid lane", CorruptionInvalidLane, nil,
+			[]session.Record{func() session.Record { r := started(1, "run"); r.Lane = "sideways"; return r }()}},
+		{"non monotonic seq", CorruptionNonMonotonicSeq, nil,
+			[]session.Record{started(1, "run"), rec(1, session.RecordAbortRequested)}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

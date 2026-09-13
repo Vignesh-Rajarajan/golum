@@ -13,9 +13,11 @@ import (
 	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness"
+	"github.com/Vignesh-Rajarajan/golum/pkg/harness/harnesstest"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness/session"
 	"github.com/Vignesh-Rajarajan/golum/pkg/hooks"
 	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
+	"github.com/Vignesh-Rajarajan/golum/pkg/mcp"
 	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
 	"github.com/Vignesh-Rajarajan/golum/pkg/skill"
 	"github.com/Vignesh-Rajarajan/golum/pkg/tool"
@@ -78,6 +80,14 @@ type Result struct {
 	// Violations are approval denials and sandbox refusals observed during the
 	// run.
 	Violations []PolicyViolation
+	// NativeToolCount is how many tool schemas were advertised to the model.
+	NativeToolCount int
+	DatasetVersion  string
+	TaskHash        string
+	Seed            string
+	BuildID         string
+	InitialManifest []string
+	FinalManifest   []string
 
 	trajOnce sync.Once
 	traj     []TrajectoryStep
@@ -97,6 +107,13 @@ type Options struct {
 	// ReplayFrom can restore filesystem state at a trajectory cut. Off by
 	// default: it is only needed for prefix replay.
 	SnapshotWorkspace bool
+	// MCPBackends are extra operations reachable only through invoke.
+	MCPBackends []mcp.Backend
+	// BaseURL and APIKey override the process environment when set.
+	BaseURL string
+	APIKey  string
+	// Script, when set, starts a local scripted model for this run.
+	Script []harnesstest.Turn
 }
 
 // Harness adapts golum's AgentHarness for behavioral evals.
@@ -148,17 +165,50 @@ func (h *Harness) run(
 	t.Helper()
 	start := time.Now()
 
-	model, err := ResolveModel(h.opts.Model, os.Getenv)
-	if err != nil {
-		return nil, err
+	model := h.opts.Model
+	if model == "" && len(h.opts.Script) > 0 {
+		model = "gpt-4o"
+	}
+	if model == "" {
+		var err error
+		model, err = ResolveModel(h.opts.Model, os.Getenv)
+		if err != nil {
+			return nil, err
+		}
 	}
 	cfg := buildConfig(model)
-	client := llm.NewClient(cfg)
+	if h.opts.BaseURL != "" {
+		cfg.BaseURL = h.opts.BaseURL
+	}
+	if h.opts.APIKey != "" {
+		cfg.OpenAIAPIKey = h.opts.APIKey
+	}
+	var client *llm.Client
+	if len(h.opts.Script) > 0 {
+		mock := harnesstest.NewScriptedModel()
+		defer mock.Close()
+		mock.Script(h.opts.Script...)
+		client = mock.Client()
+		cfg.BaseURL = mock.BaseURL()
+		cfg.OpenAIAPIKey = "test-key"
+		cfg.Model = model
+		if cfg.Model == "" {
+			cfg.Model = "gpt-4o"
+		}
+	} else {
+		client = llm.NewClient(cfg)
+	}
 	reg, todos := buildRegistry(h.opts.ActiveTools)
+	if cat := tool.CatalogOf(reg); cat != nil {
+		for _, b := range h.opts.MCPBackends {
+			cat.Add(b)
+		}
+	}
 	loop := mergeEvalLoop(h.opts.Loop)
 	approvals := NewRecordingApprovals(h.opts.Approvals)
 
 	snapshots := ""
+	var err error
 	if h.opts.SnapshotWorkspace {
 		if snapshots, err = prepareSnapshotDir(runID); err != nil {
 			return nil, err
@@ -182,11 +232,12 @@ func (h *Harness) run(
 	}
 
 	result := &Result{
-		RunID:       runID,
-		Workspace:   workspace,
-		SnapshotDir: snapshots,
-		Harness:     h.Name,
-		Usage:       Usage{Model: model},
+		RunID:           runID,
+		Workspace:       workspace,
+		SnapshotDir:     snapshots,
+		Harness:         h.Name,
+		Usage:           Usage{Model: model},
+		NativeToolCount: len(reg.AsLLMTools()),
 	}
 	var accumulated contextmgr.TokenUsage
 	var records []session.Record
@@ -530,6 +581,12 @@ func mergeEvalLoop(override harness.LoopConfig) harness.LoopConfig {
 	}
 	if override.StreamTimeout != 0 {
 		base.StreamTimeout = override.StreamTimeout
+	}
+	if override.ForceTool != "" {
+		base.ForceTool = override.ForceTool
+	}
+	if override.ForceToolAttempts != 0 {
+		base.ForceToolAttempts = override.ForceToolAttempts
 	}
 	return base
 }

@@ -35,6 +35,7 @@ func Dataset() evals.Dataset {
 	tasks = append(tasks, factualTasks()...)
 	tasks = append(tasks, filesystemTasks()...)
 	tasks = append(tasks, skillTasks()...)
+	tasks = append(tasks, mcpTasks()...)
 	for i := range tasks {
 		tasks[i].Version = Version
 	}

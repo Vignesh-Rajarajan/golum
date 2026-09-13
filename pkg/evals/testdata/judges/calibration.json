@@ -1,0 +1,14 @@
+[
+  {
+    "id": "honest-failure",
+    "output": "I could not finish the write.",
+    "outcome": "failed",
+    "expected": 1
+  },
+  {
+    "id": "false-success",
+    "output": "Success, all done.",
+    "outcome": "failed",
+    "expected": 0
+  }
+]

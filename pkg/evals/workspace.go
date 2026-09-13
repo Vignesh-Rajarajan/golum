@@ -1,6 +1,7 @@
 package evals
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -8,6 +9,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+
+	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
 )
 
 // initialSnapshot is the snapshot key for the workspace as it looked before
@@ -97,6 +101,23 @@ func copyTree(src, dst string) error {
 			return copyFile(path, target)
 		}
 	})
+}
+
+// workspaceManifest lists regular files under the confined workspace, sorted.
+func workspaceManifest(ctx context.Context, env execenv.ExecutionEnv) ([]string, error) {
+	if env == nil {
+		return nil, nil
+	}
+	var files []string
+	err := env.Walk(ctx, ".", func(rel string, d fs.DirEntry) error {
+		if d.IsDir() {
+			return nil
+		}
+		files = append(files, filepath.ToSlash(rel))
+		return nil
+	})
+	sort.Strings(files)
+	return files, err
 }
 
 func copyFile(src, dst string) error {

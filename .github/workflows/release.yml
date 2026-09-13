@@ -1,0 +1,29 @@
+name: release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Full test and race
+        run: |
+          go test ./...
+          go test -race ./pkg/harness ./pkg/harness/session ./pkg/evals
+      - name: Dataset hashes
+        run: go test ./pkg/evals/tasks/v1 -run TestV1HashesAreFrozen -count=1
+      - name: Holdout evals
+        if: env.OPENAI_API_KEY != '' || env.OPENROUTER_API_KEY != ''
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GOLUM_EVAL_SPLIT: holdout
+        run: go test -tags evals ./pkg/evals/suite -count=1
+        continue-on-error: true

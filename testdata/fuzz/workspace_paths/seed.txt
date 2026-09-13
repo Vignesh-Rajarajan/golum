@@ -1,0 +1,4 @@
+../escape
+/etc/passwd
+workspace/note.txt
+.golum/artifacts/ok.txt

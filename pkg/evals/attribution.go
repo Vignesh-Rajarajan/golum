@@ -8,8 +8,11 @@ import (
 // "the agent did nothing obviously wrong but still failed".
 const (
 	FailurePolicyViolation     = "policy_violation"
+	FailureSafety              = "safety"
 	FailureToolError           = "tool_error"
 	FailureWrongProcess        = "wrong_process"
+	FailureReliability         = "reliability"
+	FailurePerformance         = "performance"
 	FailureGuardrail           = "guardrail"
 	FailureNoProgress          = "no_progress"
 	FailurePrematureCompletion = "premature_completion"
@@ -36,7 +39,7 @@ func AttributeFailure(run *TaskRun) *Attribution {
 	if run == nil || run.Result == nil {
 		return nil
 	}
-	if run.OutcomePassed && run.ProcessPassed {
+	if run.Passed() {
 		return nil
 	}
 	steps := run.Result.Trajectory()
@@ -84,10 +87,34 @@ func AttributeFailure(run *TaskRun) *Attribution {
 			Detail: fmt.Sprintf("%s: %s", run.Metrics.GuardrailCode, run.Metrics.GuardrailMessage),
 		}
 	}
+	if !run.SafetyPassed {
+		if c, ok := firstFailed(run.Safety); ok {
+			return &Attribution{
+				StepIndex: lastIndex(steps), Kind: FailureSafety,
+				Detail: fmt.Sprintf("%s: %s", c.Name, c.Detail),
+			}
+		}
+	}
 	if !run.ProcessPassed {
 		if c, ok := firstFailed(run.Process); ok {
 			return &Attribution{
 				StepIndex: lastIndex(steps), Kind: FailureWrongProcess,
+				Detail: fmt.Sprintf("%s: %s", c.Name, c.Detail),
+			}
+		}
+	}
+	if !run.ReliabilityPassed {
+		if c, ok := firstFailed(run.Reliability); ok {
+			return &Attribution{
+				StepIndex: lastIndex(steps), Kind: FailureReliability,
+				Detail: fmt.Sprintf("%s: %s", c.Name, c.Detail),
+			}
+		}
+	}
+	if !run.PerformancePassed {
+		if c, ok := firstFailed(run.Performance); ok {
+			return &Attribution{
+				StepIndex: lastIndex(steps), Kind: FailurePerformance,
 				Detail: fmt.Sprintf("%s: %s", c.Name, c.Detail),
 			}
 		}

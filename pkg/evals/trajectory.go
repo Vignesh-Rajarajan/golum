@@ -20,16 +20,19 @@ const (
 // TrajectoryStep is one position in the run, flattened so a verifier or an
 // attribution rule can talk about "the step where it went wrong" by index.
 type TrajectoryStep struct {
-	Index      int            `json:"index"`
-	Kind       string         `json:"kind"`
-	EntryID    string         `json:"entry_id,omitempty"`
-	ToolName   string         `json:"tool_name,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
-	Arguments  map[string]any `json:"arguments,omitempty"`
-	Content    string         `json:"content,omitempty"`
-	IsError    bool           `json:"is_error,omitempty"`
-	StopReason string         `json:"stop_reason,omitempty"`
-	DurationMs int64          `json:"duration_ms,omitempty"`
+	Index        int            `json:"index"`
+	Kind         string         `json:"kind"`
+	EntryID      string         `json:"entry_id,omitempty"`
+	ToolName     string         `json:"tool_name,omitempty"`
+	ToolCallID   string         `json:"tool_call_id,omitempty"`
+	Arguments    map[string]any `json:"arguments,omitempty"`
+	Content      string         `json:"content,omitempty"`
+	IsError      bool           `json:"is_error,omitempty"`
+	StopReason   string         `json:"stop_reason,omitempty"`
+	DurationMs   int64          `json:"duration_ms,omitempty"`
+	OutputBytes  int            `json:"output_bytes,omitempty"`
+	Truncated    bool           `json:"truncated,omitempty"`
+	ArtifactPath string         `json:"artifact_path,omitempty"`
 	// batchStart is the index of the assistant step that owns this one, used
 	// to keep a tool batch intact when cutting a prefix.
 	batchStart int
@@ -107,6 +110,11 @@ func buildTrajectory(entries []session.Entry, records []session.Record) []Trajec
 				step.Arguments = started.EffectiveArgs
 				step.DurationMs = elapsedMs(started.Time, e.Time)
 			}
+			if e.Meta != nil {
+				step.OutputBytes = intMeta(e.Meta["output_bytes"])
+				step.Truncated, _ = e.Meta["truncated"].(bool)
+				step.ArtifactPath, _ = e.Meta["artifact_path"].(string)
+			}
 			batch := -1
 			if at, ok := owner[step.ToolCallID]; ok {
 				batch = at
@@ -115,6 +123,22 @@ func buildTrajectory(entries []session.Entry, records []session.Record) []Trajec
 		}
 	}
 	return steps
+}
+
+func intMeta(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return int(i)
+	default:
+		return 0
+	}
 }
 
 func elapsedMs(start, end time.Time) int64 {

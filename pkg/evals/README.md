@@ -7,25 +7,31 @@ temporary workspace, and attach native session transcripts as artifacts.
 Use them to measure end-to-end behavior and compare prompts, tools, skills,
 models, or other harness configurations.
 
-## The three axes
+## The five verdicts
 
-Every task is scored on three axes that are reported separately and never
-blended into one number:
+Every task is scored on five independent deterministic axes plus an
+informational quality axis. They are never blended into one number:
 
 | Axis | Question | Authority |
 |---|---|---|
-| **Outcome** | Did it produce the correct result? | Deterministic, authoritative |
-| **Process** | Did it use an allowed process? | Deterministic, authoritative |
+| **Outcome** | Did the workspace and final answer become correct? | Deterministic, authoritative |
+| **Process** | Did it use the correct tools, arguments, and order? | Deterministic, authoritative |
+| **Safety** | Did it obey approvals, sandbox, and secret rules? | Deterministic, hard gate |
+| **Reliability** | Did restart, retry, cancel, and replay behave? | Deterministic, authoritative |
+| **Performance** | Did it stay within latency, token, cost, and call budgets? | Deterministic, authoritative |
 | **Response** | Was the answer any good? | LLM-judged, informational only |
 
-A single score cannot answer the question that actually comes up when an eval
-regresses: did the agent stop producing the right result, stop following the
-rules, or just start explaining itself worse? A run that wrote the right file
-by a forbidden route and a run that followed every rule but wrote nothing are
-both failures, and they need different fixes.
+A fluent answer must never compensate for a policy violation.
+`TaskRun.Passed()` requires all five deterministic axes. Subjective judges
+never override them.
 
-Subjective judges never override the deterministic axes. `TaskRun.Passed()`
-looks only at Outcome and Process.
+`pkg/evals/tasks/v1` is frozen (`testdata/hashes.json`). New corpus lives in
+`pkg/evals/tasks/v2` and can be driven by `Environment.Script` against a local
+OpenAI-compatible server so PRs do not need a real model.
+
+CI gates: PR (`go test` + harness race + dataset validation), merge (full
+crash/SQLite/MCP suite), nightly (real-model repetitions), release (holdout +
+hash verification). `CompareToBaseline` classifies regressions by axis.
 
 ## Running evals
 
@@ -108,7 +114,13 @@ boundary as the code it grades:
 Process verifiers read the trajectory:
 
 `ToolUsed`, `ToolNotUsed`, `ToolCallOrder`, `MaxToolCalls`, `NoToolErrors`,
-`NoPolicyViolation`.
+`NoPolicyViolation`, `ToolResultsWithinBytes`, `ToolTruncationsHaveArtifact`.
+
+`Environment.ForceTool` copies onto the loop so a run cannot complete without a
+successful invocation of that tool. Extra MCP operations are reached only
+through `invoke`; they never join the native tool roster (`Metrics.NativeToolCount`).
+Oversized tool results spill to `.golum/artifacts/` and the preview stays within
+`MaxToolResultBytes`.
 
 Both accept custom predicates through `OutcomeFunc` and `ProcessFunc`, and an
 existing `Judge` can be lifted onto either axis with `OutcomeFromJudge` /
@@ -227,7 +239,10 @@ reproducible under `GOLUM_EVAL_SEED`.
 |---|---|
 | `harness.go` | `Harness.Run`, `Result`, steps, session wiring |
 | `task.go` | `Task`, `InitialState`, `Environment`, `AcceptanceCriteria` |
-| `verifier.go` | `Check`, outcome and process verifiers |
+| `verifier.go` | `Check`, outcome, process, safety, reliability, and performance verifiers |
+| `safety.go` | Hard-gate safety verifiers |
+| `judge_quality.go` | Quality and groundedness judges |
+| `regression.go` | Baseline comparison classified by axis |
 | `trajectory.go` | `TrajectoryStep`, `SafeCutIndex`, prefix helpers |
 | `metrics.go` | Per-run accounting derived from session records |
 | `approvals.go` | Approval policies and recorded policy violations |
@@ -239,17 +254,18 @@ reproducible under `GOLUM_EVAL_SEED`.
 | `report.go` | `TaskReport`, `Report`, JSON and markdown writers |
 | `replay.go` | Trajectory-prefix replay |
 | `artifact.go` | `runs.jsonl` index and session transcripts |
-| `tasks/v1/` | The versioned task dataset and its seeds |
+| `tasks/v1/` | Frozen historical task dataset (`testdata/hashes.json`) |
+| `tasks/v2/` | Scripted-model contract, force-tool, MCP, and injection tasks |
 | `suite/` | The dataset runner (`//go:build evals`) |
 
-The dataset runner lives in its own package because `tasks/v1` imports
-`pkg/evals`: a test inside package `evals` cannot import the dataset without an
-import cycle.
+The dataset runner lives in its own package because `tasks/v1` and
+`tasks/v2` import `pkg/evals`: a test inside package `evals` cannot import
+the dataset without an import cycle.
 
 ## Artifacts
 
 Each invocation prints an ignored `.eval/` artifact directory. `runs.jsonl`
-indexes completed runs, including the three verifier axes, metrics, and
+indexes completed runs, including the five verdict axes, metrics, and
 attribution; session transcripts live under `sessions/*.json`; `report.json`
 and `report.md` summarize the whole run. Workspace snapshots, when enabled,
 live under `snapshots/`.
