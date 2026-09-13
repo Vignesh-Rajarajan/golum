@@ -3,26 +3,11 @@
 package evals
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
-
-func scoreAll(t *testing.T, ctx context.Context, result *Result, input string, judges ...Judge) []Score {
-	t.Helper()
-	out := make([]Score, 0, len(judges))
-	for _, j := range judges {
-		s, err := j(ctx, result, input)
-		if err != nil {
-			t.Fatalf("judge: %v", err)
-		}
-		out = append(out, s)
-		t.Logf("score=%.0f rationale=%s", s.Value, s.Rationale)
-	}
-	return out
-}
 
 func writeArtifact(t *testing.T, result *Result, scores []Score) {
 	t.Helper()

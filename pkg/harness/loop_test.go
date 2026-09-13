@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
 	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
@@ -188,6 +189,73 @@ func TestToolCallHash_stable(t *testing.T) {
 	}
 }
 
+func TestTruncateResultIsBoundedAndUTF8Safe(t *testing.T) {
+	input := strings.Repeat("界", 20) + "tail"
+	for _, max := range []int{1, 5, 20, 40, 60} {
+		got := truncateResult(input, max)
+		if len(got) > max {
+			t.Fatalf("max=%d got %d bytes", max, len(got))
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("max=%d produced invalid UTF-8: %q", max, got)
+		}
+	}
+}
+
+func TestDispatchToolCallRecordsFullSize(t *testing.T) {
+	root := t.TempDir()
+	blob := strings.Repeat("A", 5000)
+	if err := os.WriteFile(filepath.Join(root, "big.txt"), []byte(blob), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sess, reg, env, todos := testSession(t, root)
+	cfg := DefaultLoopConfig()
+	cfg.MaxToolResultBytes = 200
+	tc := &llm.ToolCall{
+		ID: "c1", Name: "read_file",
+		Arguments: map[string]any{"path": "big.txt"},
+	}
+	content, result, _ := dispatchToolCall(context.Background(), tc, testDeps(sess, reg, env, nil, todos), cfg, func(AgentEvent) {})
+	if result.OutputBytes < len(blob) {
+		t.Fatalf("OutputBytes=%d want at least the raw file size %d", result.OutputBytes, len(blob))
+	}
+	if result.Truncated {
+		t.Fatal("dispatch should leave bounding to spillAndBound")
+	}
+	if len(content) < len(blob) {
+		t.Fatalf("dispatch truncated early: %d bytes", len(content))
+	}
+}
+
+func TestSpillAndBoundWritesArtifact(t *testing.T) {
+	root := t.TempDir()
+	env, err := execenv.NewOsExecutionEnv(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := strings.Repeat("A", 5000)
+	got := spillAndBound(context.Background(), env, tool.Result{Content: full}, 200, "call_1")
+	if !got.Truncated || len(got.Content) > 200 {
+		t.Fatalf("preview = %d truncated=%v", len(got.Content), got.Truncated)
+	}
+	if got.OutputBytes != len(full) {
+		t.Fatalf("OutputBytes=%d want %d", got.OutputBytes, len(full))
+	}
+	if got.ArtifactPath != ".golum/artifacts/call_1.txt" {
+		t.Fatalf("artifact path=%q", got.ArtifactPath)
+	}
+	if !strings.Contains(got.Content, got.ArtifactPath) {
+		t.Fatalf("preview missing artifact path: %q", got.Content)
+	}
+	saved, err := env.ReadTextFile(context.Background(), got.ArtifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved != full {
+		t.Fatalf("artifact size %d want %d", len(saved), len(full))
+	}
+}
+
 func TestEditTool_ambiguous(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("aa aa aa"), 0o644); err != nil {
@@ -219,16 +287,16 @@ func TestRunAgentLoop_cancelSynthesizesResults(t *testing.T) {
 	balancedToolMessages(t, sess)
 }
 
-func TestDefaultRegistry_hasEightTools(t *testing.T) {
+func TestDefaultRegistry_hasNineTools(t *testing.T) {
 	reg, _ := tool.DefaultRegistry(nil)
-	want := []string{"read_file", "write_file", "edit", "list_dir", "glob", "grep", "shell", "todos"}
+	want := []string{"read_file", "write_file", "edit", "list_dir", "glob", "grep", "shell", "todos", "invoke"}
 	for _, name := range want {
 		if _, ok := reg.Get(name); !ok {
 			t.Errorf("missing tool %s", name)
 		}
 	}
-	if len(reg.Names()) != 8 {
-		t.Fatalf("expected 8 tools, got %d: %v", len(reg.Names()), reg.Names())
+	if len(reg.Names()) != 9 {
+		t.Fatalf("expected 9 tools, got %d: %v", len(reg.Names()), reg.Names())
 	}
 }
 

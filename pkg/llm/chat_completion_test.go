@@ -762,6 +762,23 @@ func TestBuildRequest_WithToolsSetsToolChoiceAuto(t *testing.T) {
 	}
 }
 
+func TestBuildRequest_NamedToolChoice(t *testing.T) {
+	c := NewClient(&config.Config{OpenAIAPIKey: "test-key", Model: "gpt-4o"})
+	tools := []Tool{{Type: "function", Function: ToolFunction{Name: "write_file"}}}
+
+	req := c.buildRequest(nil, ChatCompletionOptions{
+		Tools: tools, ToolChoice: ToolChoice{Name: "write_file"},
+	})
+	obj, ok := req.ToolChoice.(map[string]any)
+	if !ok {
+		t.Fatalf("expected function tool_choice object, got %T %v", req.ToolChoice, req.ToolChoice)
+	}
+	fn, _ := obj["function"].(map[string]any)
+	if obj["type"] != "function" || fn["name"] != "write_file" {
+		t.Fatalf("tool_choice = %#v", req.ToolChoice)
+	}
+}
+
 func TestBuildRequest_WithoutToolsLeavesToolChoiceUnset(t *testing.T) {
 	c := NewClient(&config.Config{OpenAIAPIKey: "test-key", Model: "gpt-4o"})
 

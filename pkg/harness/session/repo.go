@@ -181,7 +181,7 @@ func (r *FileSessionRepo) Create(ctx context.Context) (Session, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	id := fmt.Sprintf("sess_%d", time.Now().UnixNano())
+	id := NewSessionID()
 	ctxMgr := contextmgr.NewContextManager(r.cfg, r.promptCfg, nil, r.tools)
 	inner := NewInMemorySession(id, ctxMgr)
 	js := &JsonlSession{InMemorySession: inner, path: r.pathFor(id)}

@@ -1,0 +1,19 @@
+name: merge
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Full deterministic suite
+        run: go test ./pkg/harness ./pkg/harness/session ./pkg/evals ./pkg/tool ./pkg/execenv ./pkg/mcp ./pkg/llm/...
+      - name: Race
+        run: go test -race ./pkg/harness ./pkg/harness/session ./pkg/evals

@@ -10,6 +10,7 @@ import (
 	"github.com/Vignesh-Rajarajan/golum/pkg/config"
 	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
+	"github.com/Vignesh-Rajarajan/golum/pkg/harness/harnesstest"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness/session"
 	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
 	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
@@ -65,13 +66,13 @@ func TestRunAgentLoop_ToolRoundTrip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "hello.txt"), []byte("world\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mock := newMockLLM()
+	mock := harnesstest.NewScriptedModel()
 	defer mock.Close()
 	mock.Script(
-		mockTurn{Content: "reading", ToolCalls: []mockToolCall{
+		harnesstest.Turn{Content: "reading", ToolCalls: []harnesstest.ToolCall{
 			{ID: "call_1", Name: "read_file", Args: `{"path":"hello.txt"}`},
 		}},
-		mockTurn{Content: "The file says world."},
+		harnesstest.Turn{Content: "The file says world."},
 	)
 
 	cfg := &config.Config{Model: "gpt-4o", ContextWindow: 128000}
@@ -110,17 +111,193 @@ func TestRunAgentLoop_ToolRoundTrip(t *testing.T) {
 	}
 }
 
+type bulkyTool struct{ payload string }
+
+func (t bulkyTool) Name() string               { return "bulky" }
+func (t bulkyTool) Description() string        { return "returns a large payload" }
+func (t bulkyTool) Parameters() map[string]any { return map[string]any{} }
+func (t bulkyTool) Execute(context.Context, map[string]any, execenv.ExecutionEnv) (tool.Result, error) {
+	return tool.Result{Content: t.payload}, nil
+}
+
+// Oversized tool output is clipped before the next model request and the
+// original size is journaled so evals can assert the bound without parsing
+// the preview string.
+func TestRunAgentLoop_TruncatesOversizedToolResult(t *testing.T) {
+	root := t.TempDir()
+	mock := harnesstest.NewScriptedModel()
+	defer mock.Close()
+	mock.Script(
+		harnesstest.Turn{ToolCalls: []harnesstest.ToolCall{
+			{ID: "call_1", Name: "bulky", Args: `{}`},
+		}},
+		harnesstest.Turn{Content: "done"},
+	)
+
+	cfg := &config.Config{Model: "gpt-4o", ContextWindow: 128000}
+	sess, deps := loopTestEnv(t, root, cfg)
+	deps.Client = mock.Client()
+	payload := strings.Repeat("A", 10_000)
+	deps.Registry.Register(bulkyTool{payload: payload})
+	if _, err := sess.AppendUserMessage("call bulky"); err != nil {
+		t.Fatal(err)
+	}
+
+	loop := DefaultLoopConfig()
+	loop.MaxToolResultBytes = 200
+	if err := RunAgentLoop(context.Background(), deps, loop, nil); err != nil {
+		t.Fatalf("loop error: %v", err)
+	}
+	if mock.RequestCount() != 2 {
+		t.Fatalf("expected 2 model invocations, got %d", mock.RequestCount())
+	}
+
+	var result session.Entry
+	for _, e := range sess.Entries() {
+		if e.Kind == session.EntryToolResult {
+			result = e
+			break
+		}
+	}
+	if result.ID == "" {
+		t.Fatal("no tool result was journaled")
+	}
+	if len(result.Content) > loop.MaxToolResultBytes {
+		t.Fatalf("journaled %d bytes, limit %d", len(result.Content), loop.MaxToolResultBytes)
+	}
+	truncated, _ := result.Meta["truncated"].(bool)
+	if !truncated {
+		t.Fatalf("expected truncated=true in meta: %+v", result.Meta)
+	}
+	if bytes := metaInt(result.Meta["output_bytes"]); bytes < len(payload) {
+		t.Fatalf("output_bytes=%d want >= %d", bytes, len(payload))
+	}
+	path, _ := result.Meta["artifact_path"].(string)
+	if path == "" {
+		t.Fatal("expected artifact_path in meta")
+	}
+	saved, err := os.ReadFile(filepath.Join(root, path))
+	if err != nil {
+		t.Fatalf("read artifact: %v", err)
+	}
+	if string(saved) != payload {
+		t.Fatalf("artifact size %d want %d", len(saved), len(payload))
+	}
+	if !strings.Contains(result.Content, path) {
+		t.Fatalf("preview missing artifact path: %q", result.Content)
+	}
+
+	followUp := mock.Requests[1]
+	toolContent := harnesstest.ToolRoleContent(followUp)
+	if len(toolContent) > loop.MaxToolResultBytes {
+		t.Fatalf("follow-up request still carries %d bytes", len(toolContent))
+	}
+	if strings.Count(toolContent, "A") == len(payload) {
+		t.Fatal("follow-up request received the unbounded payload")
+	}
+	if !harnesstest.RequestHasAgentStatus(followUp) {
+		t.Fatal("follow-up request missing request-scoped agent_status")
+	}
+	for _, e := range sess.Entries() {
+		if strings.Contains(e.Content, "<agent_status>") {
+			t.Fatal("agent_status was persisted into the durable session")
+		}
+	}
+}
+
+func TestRunAgentLoop_ForceToolCannotFinishWithoutCall(t *testing.T) {
+	root := t.TempDir()
+	mock := harnesstest.NewScriptedModel()
+	defer mock.Close()
+	mock.Script(
+		harnesstest.Turn{Content: "hello there"},
+		harnesstest.Turn{Content: "still just talking"},
+	)
+	cfg := &config.Config{Model: "gpt-4o", ContextWindow: 128000}
+	sess, deps := loopTestEnv(t, root, cfg)
+	deps.Client = mock.Client()
+	_, _ = sess.AppendUserMessage("say hi")
+
+	loop := DefaultLoopConfig()
+	loop.ForceTool = "write_file"
+	loop.ForceToolAttempts = 2
+	if err := RunAgentLoop(context.Background(), deps, loop, nil); err != nil {
+		t.Fatalf("loop error: %v", err)
+	}
+	if mock.RequestCount() != 2 {
+		t.Fatalf("expected 2 attempts, got %d", mock.RequestCount())
+	}
+	records, _ := sess.FindRecords(session.RecordQuery{Lane: "main"})
+	var finished session.Record
+	for _, r := range records {
+		if r.Type == session.RecordOperationFinished {
+			finished = r
+		}
+	}
+	if finished.Outcome != "failed" || finished.Error == nil || finished.Error.Code != "force_tool" {
+		t.Fatalf("finish = %+v", finished)
+	}
+}
+
+func TestRunAgentLoop_ForceToolSucceedsOnRetry(t *testing.T) {
+	root := t.TempDir()
+	mock := harnesstest.NewScriptedModel()
+	defer mock.Close()
+	mock.Script(
+		harnesstest.Turn{Content: "hello"},
+		harnesstest.Turn{ToolCalls: []harnesstest.ToolCall{
+			{ID: "call_w", Name: "write_file", Args: `{"path":"note.txt","content":"EVAL_OK"}`},
+		}},
+		harnesstest.Turn{Content: "done"},
+	)
+	cfg := &config.Config{Model: "gpt-4o", ContextWindow: 128000}
+	sess, deps := loopTestEnv(t, root, cfg)
+	deps.Client = mock.Client()
+	_, _ = sess.AppendUserMessage("say hi")
+
+	loop := DefaultLoopConfig()
+	loop.ForceTool = "write_file"
+	if err := RunAgentLoop(context.Background(), deps, loop, nil); err != nil {
+		t.Fatalf("loop error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "note.txt")); err != nil {
+		t.Fatal("expected write_file to run")
+	}
+	records, _ := sess.FindRecords(session.RecordQuery{Lane: "main"})
+	for _, r := range records {
+		if r.Type == session.RecordOperationFinished && r.Outcome != "completed" {
+			t.Fatalf("outcome=%s err=%v", r.Outcome, r.Error)
+		}
+	}
+	if !harnesstest.RequestHasNamedToolChoice(mock.Requests[1], "write_file") {
+		t.Fatalf("retry request should name write_file: %#v", mock.Requests[1]["tool_choice"])
+	}
+}
+
+func metaInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	default:
+		return 0
+	}
+}
+
 // TestRunAgentLoop_UnknownToolStaysBalanced verifies the loop's core invariant
 // through the real code path rather than by calling dispatchToolCall directly.
 func TestRunAgentLoop_UnknownToolStaysBalanced(t *testing.T) {
 	root := t.TempDir()
-	mock := newMockLLM()
+	mock := harnesstest.NewScriptedModel()
 	defer mock.Close()
 	mock.Script(
-		mockTurn{ToolCalls: []mockToolCall{
+		harnesstest.Turn{ToolCalls: []harnesstest.ToolCall{
 			{ID: "call_bad", Name: "no_such_tool", Args: `{}`},
 		}},
-		mockTurn{Content: "recovered"},
+		harnesstest.Turn{Content: "recovered"},
 	)
 
 	cfg := &config.Config{Model: "gpt-4o", ContextWindow: 128000}
@@ -139,13 +316,13 @@ func TestRunAgentLoop_UnknownToolStaysBalanced(t *testing.T) {
 // end-to-end, including the follow-up turn the model gets to recover in.
 func TestRunAgentLoop_ApprovalDeniedStaysBalanced(t *testing.T) {
 	root := t.TempDir()
-	mock := newMockLLM()
+	mock := harnesstest.NewScriptedModel()
 	defer mock.Close()
 	mock.Script(
-		mockTurn{ToolCalls: []mockToolCall{
+		harnesstest.Turn{ToolCalls: []harnesstest.ToolCall{
 			{ID: "call_w", Name: "write_file", Args: `{"path":"x.txt","content":"hi"}`},
 		}},
-		mockTurn{Content: "understood, not writing"},
+		harnesstest.Turn{Content: "understood, not writing"},
 	)
 
 	cfg := &config.Config{Model: "gpt-4o", ContextWindow: 128000}
@@ -172,12 +349,12 @@ func TestRunAgentLoop_ApprovalDeniedStaysBalanced(t *testing.T) {
 // retries once when the provider rejects the request for length.
 func TestRunAgentLoop_ContextOverflowRecovers(t *testing.T) {
 	root := t.TempDir()
-	mock := newMockLLM()
+	mock := harnesstest.NewScriptedModel()
 	defer mock.Close()
 	mock.Script(
-		mockTurn{Status: 400, ErrorBody: `{"error":{"message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}`},
-		mockTurn{NonStream: true, Content: "## ORIGINAL GOAL\nDo the thing.\n## COMPLETED ACTIONS\n- step one"},
-		mockTurn{Content: "recovered after compaction"},
+		harnesstest.Turn{Status: 400, ErrorBody: `{"error":{"message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}`},
+		harnesstest.Turn{NonStream: true, Content: "## ORIGINAL GOAL\nDo the thing.\n## COMPLETED ACTIONS\n- step one"},
+		harnesstest.Turn{Content: "recovered after compaction"},
 	)
 
 	// A large window keeps auto-compaction from firing, so the only thing that
@@ -318,9 +495,9 @@ func TestDeriveContextEntries_LastCompactionWins(t *testing.T) {
 
 func TestCompactor_KeepsRecentHistoryAndStaysBalanced(t *testing.T) {
 	root := t.TempDir()
-	mock := newMockLLM()
+	mock := harnesstest.NewScriptedModel()
 	defer mock.Close()
-	mock.Script(mockTurn{NonStream: true,
+	mock.Script(harnesstest.Turn{NonStream: true,
 		Content: "## ORIGINAL GOAL\nBuild it.\n## COMPLETED ACTIONS\n- did stuff"})
 
 	cfg := &config.Config{Model: "gpt-4o", ContextWindow: 1000}
@@ -365,9 +542,9 @@ func TestCompactor_KeepsRecentHistoryAndStaysBalanced(t *testing.T) {
 
 func TestCompactor_CooldownSuppressesRepeat(t *testing.T) {
 	root := t.TempDir()
-	mock := newMockLLM()
+	mock := harnesstest.NewScriptedModel()
 	defer mock.Close()
-	mock.Script(mockTurn{NonStream: true, Content: "summary"})
+	mock.Script(harnesstest.Turn{NonStream: true, Content: "summary"})
 
 	cfg := &config.Config{Model: "gpt-4o", ContextWindow: 10}
 	sess, _ := loopTestEnv(t, root, cfg)
@@ -398,9 +575,9 @@ func TestCompactor_CooldownSuppressesRepeat(t *testing.T) {
 
 func TestCompactor_SurvivesReload(t *testing.T) {
 	dir := t.TempDir()
-	mock := newMockLLM()
+	mock := harnesstest.NewScriptedModel()
 	defer mock.Close()
-	mock.Script(mockTurn{NonStream: true, Content: "## ORIGINAL GOAL\nthe goal"})
+	mock.Script(harnesstest.Turn{NonStream: true, Content: "## ORIGINAL GOAL\nthe goal"})
 
 	cfg := &config.Config{Model: "gpt-4o", ContextWindow: 1000}
 	store, err := session.OpenSQLiteStore(filepath.Join(dir, "g.db"), cfg,

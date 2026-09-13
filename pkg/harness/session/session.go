@@ -152,7 +152,7 @@ type InMemorySession struct {
 // NewInMemorySession creates a session wrapping ctxMgr.
 func NewInMemorySession(id string, ctxMgr *contextmgr.ContextManager) *InMemorySession {
 	if id == "" {
-		id = fmt.Sprintf("sess_%d", time.Now().UnixNano())
+		id = NewSessionID()
 	}
 	return &InMemorySession{
 		id:          id,
@@ -293,6 +293,23 @@ func (s *InMemorySession) AppendRecord(r Record) (Record, error) {
 	}
 	s.records = append(s.records, r)
 	return r, nil
+}
+
+// LoadRecord appends a previously persisted record without assigning a new
+// sequence number. Restart and reload use this so a rebuilt session sees the
+// same journal the crashed process left behind.
+func (s *InMemorySession) LoadRecord(r Record) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.records {
+		if existing.ID == r.ID {
+			return
+		}
+	}
+	s.records = append(s.records, r)
+	if int(r.Seq) > s.seq {
+		s.seq = int(r.Seq)
+	}
 }
 
 func (s *InMemorySession) FindRecords(q RecordQuery) ([]Record, error) {

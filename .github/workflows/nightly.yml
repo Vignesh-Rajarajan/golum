@@ -1,0 +1,24 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  evals:
+    if: github.repository == 'Vignesh-Rajarajan/golum'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Real-model evals
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GOLUM_EVAL_REPETITIONS: "3"
+          GOLUM_EVAL_SPLIT: dev
+        run: go test -tags evals ./pkg/evals/suite -count=1
+        continue-on-error: true

@@ -1,0 +1,11 @@
+{
+  "note": "Local baselines recorded on darwin/arm64 after the first harness bench run. Not an SLA.",
+  "machine": "darwin/arm64",
+  "validate_record_log_ns_per_op": 348174,
+  "reduce_lane_state_ns_per_op": 78108,
+  "registry_lookup_ns_per_op": 49.25,
+  "truncate_result_ns_per_op": 234.5,
+  "spill_and_bound_ns_per_op": 751.6,
+  "journal_append_ns_per_op": 31001,
+  "context_rebuild_ns_per_op": 723879
+}

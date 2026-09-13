@@ -15,6 +15,7 @@ import (
 	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
 	"github.com/Vignesh-Rajarajan/golum/pkg/sanitize"
 	"github.com/Vignesh-Rajarajan/golum/pkg/tool"
+	"github.com/sashabaranov/go-openai"
 )
 
 type Driver struct {
@@ -185,8 +186,51 @@ func (d *Driver) PeekAction(ctx context.Context) (*Action, error) {
 	}
 	if op.TerminalFailure != nil {
 		r.Outcome, r.Error = "failed", op.TerminalFailure
+		return &Action{Kind: ActionFinishOperation, Record: &r}, nil
+	}
+	decision, reason := d.afterAssistant(op, records)
+	switch decision {
+	case Continue:
+		n := 1
+		for _, rec := range records {
+			if rec.RunID == op.ID && rec.Type == session.RecordStepAttempt && rec.Step == "assistant" {
+				n++
+			}
+		}
+		if d.cfg.MaxModelInvocations > 0 && n > d.cfg.MaxModelInvocations {
+			r.Outcome = "failed"
+			r.Error = &session.OpError{Code: "model_limit", Message: reason}
+			return &Action{Kind: ActionFinishOperation, Record: &r}, nil
+		}
+		resultID := stableID("e_step_", op.ID, fmt.Sprint(n))
+		step := session.Record{
+			ID: stableID("r_step_", op.ID, fmt.Sprint(n)), Lane: "main",
+			Type: session.RecordStepAttempt, RunID: op.ID, Step: "assistant",
+			Attempt: n, ResultEntryID: resultID,
+		}
+		return &Action{Kind: ActionAppendRecord, Record: &step}, nil
+	case Fail:
+		r.Outcome = "failed"
+		r.Error = &session.OpError{Code: "force_tool", Message: reason}
+		return &Action{Kind: ActionFinishOperation, Record: &r}, nil
 	}
 	return &Action{Kind: ActionFinishOperation, Record: &r}, nil
+}
+
+func (d *Driver) afterAssistant(op *OperationState, records []session.Record) (Decision, string) {
+	dc := d.directorContext(op, records)
+	decision := Pass
+	reason := ""
+	for _, dir := range d.directorsFor(dc.Intent) {
+		got, msg := dir.AfterAssistant(dc)
+		if got > decision {
+			decision, reason = got, msg
+		}
+		if decision == Fail {
+			return decision, reason
+		}
+	}
+	return decision, reason
 }
 
 func (d *Driver) ExecuteAction(ctx context.Context) (*Action, error) {
@@ -255,6 +299,25 @@ func (d *Driver) streamAssistant(ctx context.Context, attempt session.Record) er
 	if err != nil {
 		return err
 	}
+	// Request-scoped status keeps budgets and progress visible to the model
+	// without adding ephemeral state to the durable conversation.
+	if records, recordErr := d.deps.Session.FindRecords(session.RecordQuery{Lane: "main"}); recordErr == nil {
+		messages = append(messages, openAIStatusMessage(agentStatusFor(d.deps, d.cfg, records, attempt.RunID)))
+	}
+	var forcedChoice llm.ToolChoice
+	if records, err := d.deps.Session.FindRecords(session.RecordQuery{Lane: "main"}); err == nil {
+		op := &OperationState{ID: attempt.RunID, Intent: intentFromRecords(records, attempt.RunID)}
+		dc := d.directorContext(op, records)
+		for _, dir := range d.directorsFor(dc.Intent) {
+			hint := dir.BeforeInference(dc)
+			if hint.System != "" {
+				messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleSystem, Content: hint.System})
+			}
+			if !hint.ToolChoice.IsZero() {
+				forcedChoice = hint.ToolChoice
+			}
+		}
+	}
 	if d.deps.Hooks != nil {
 		if err := d.deps.Hooks.Emit(ctx, hooks.TransformContext, &hooks.TransformContextEvent{Messages: &messages}); err != nil {
 			return d.recordHookFailure(attempt.RunID, err)
@@ -262,7 +325,7 @@ func (d *Driver) streamAssistant(ctx context.Context, attempt session.Record) er
 	}
 	opts := llm.ChatCompletionOptions{
 		Model: d.deps.Model, Stream: true, Tools: d.activeLLMTools(),
-		MaxRetries: 3, Timeout: d.cfg.StreamTimeout,
+		ToolChoice: forcedChoice, MaxRetries: 3, Timeout: d.cfg.StreamTimeout,
 	}
 	if d.deps.Hooks != nil {
 		if err := d.deps.Hooks.Emit(ctx, hooks.BeforeRequest, &hooks.BeforeRequestEvent{
@@ -357,11 +420,11 @@ func (d *Driver) executeTool(ctx context.Context, action *Action) error {
 	started := action.ToolStarted
 	tc := action.ToolCall
 	if action.SyntheticResult != nil {
-		return d.persistToolResult(*started, tc, *action.SyntheticResult)
+		return d.persistToolResult(ctx, *started, tc, *action.SyntheticResult)
 	}
 	if started.Replay == session.ReplayNever && !d.startedHere[started.ID] {
 		result := tool.Result{Content: "interrupted; not replayed", IsError: true, Display: "interrupted"}
-		return d.persistToolResult(*started, tc, result)
+		return d.persistToolResult(ctx, *started, tc, result)
 	}
 	var hookEvent *hooks.BeforeToolEvent
 	if d.deps.Hooks != nil {
@@ -374,16 +437,18 @@ func (d *Driver) executeTool(ctx context.Context, action *Action) error {
 			if hookEvent.Result == nil {
 				hookEvent.Result = &tool.Result{Content: "tool skipped by hook", IsError: true}
 			}
-			if err := d.persistToolResult(*started, tc, *hookEvent.Result); err != nil {
+			bounded := d.spillBound(ctx, *hookEvent.Result, tc.ID)
+			if err := d.persistToolResult(ctx, *started, tc, bounded); err != nil {
 				return err
 			}
-			d.emit(AgentEvent{Type: EventToolCallResult, ToolCall: tc, ToolResult: hookEvent.Result})
+			d.emit(AgentEvent{Type: EventToolCallResult, ToolCall: tc, ToolResult: &bounded})
 			return nil
 		}
 	}
 	d.emit(AgentEvent{Type: EventToolCallStart, ToolCall: tc})
 	content, result, todosChanged := dispatchToolCall(ctx, tc, d.deps, d.cfg, d.emit)
 	result.Content = content
+	originalContent := result.Content
 	if d.deps.Hooks != nil {
 		if err := d.deps.Hooks.Emit(ctx, hooks.AfterTool, &hooks.AfterToolEvent{
 			ToolName: tc.Name, Args: tc.Arguments, Result: &result,
@@ -392,7 +457,16 @@ func (d *Driver) executeTool(ctx context.Context, action *Action) error {
 		}
 		content = result.Content
 	}
-	if err := d.persistToolResult(*started, tc, result); err != nil {
+	if result.Content != originalContent {
+		// An after-tool hook replaced the payload, so the dispatch metadata no
+		// longer describes it. Re-measure before applying the shared bound.
+		result.OutputBytes = 0
+		result.Truncated = false
+		result.ArtifactPath = ""
+	}
+	result = d.spillBound(ctx, result, tc.ID)
+	content = result.Content
+	if err := d.persistToolResult(ctx, *started, tc, result); err != nil {
 		return err
 	}
 	if d.deps.Episodic != nil {
@@ -416,12 +490,19 @@ func (d *Driver) recordHookFailure(runID string, hookErr error) error {
 	return hookErr
 }
 
-func (d *Driver) persistToolResult(started session.Record, tc *llm.ToolCall, result tool.Result) error {
+func (d *Driver) persistToolResult(ctx context.Context, started session.Record, tc *llm.ToolCall, result tool.Result) error {
+	result = d.spillBound(ctx, result, tc.ID)
+	meta := map[string]any{
+		"tool_call_id": tc.ID, "is_error": result.IsError,
+		"output_bytes": result.OutputBytes, "truncated": result.Truncated,
+		"duration_ms": result.Duration.Milliseconds(),
+	}
+	if result.ArtifactPath != "" {
+		meta["artifact_path"] = result.ArtifactPath
+	}
 	_, err := d.deps.Session.AppendProvisioned(session.ProvisionedEntry{
 		ID: started.ResultEntryID, Kind: session.EntryToolResult, Role: "tool",
-		Content: result.Content, Meta: map[string]any{
-			"tool_call_id": tc.ID, "is_error": result.IsError,
-		},
+		Content: result.Content, Meta: meta,
 	})
 	return err
 }

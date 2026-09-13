@@ -6,19 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
+	"unicode/utf8"
 
-	"github.com/Vignesh-Rajarajan/golum/pkg/applog"
-	"github.com/Vignesh-Rajarajan/golum/pkg/contextmgr"
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
 	"github.com/Vignesh-Rajarajan/golum/pkg/harness/session"
 	"github.com/Vignesh-Rajarajan/golum/pkg/hooks"
 	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
+	"github.com/Vignesh-Rajarajan/golum/pkg/llm/capability"
 	"github.com/Vignesh-Rajarajan/golum/pkg/memory"
 	"github.com/Vignesh-Rajarajan/golum/pkg/observability"
-	"github.com/Vignesh-Rajarajan/golum/pkg/prompt"
-	"github.com/Vignesh-Rajarajan/golum/pkg/sanitize"
 	"github.com/Vignesh-Rajarajan/golum/pkg/tool"
 	"github.com/sashabaranov/go-openai"
 )
@@ -61,9 +58,13 @@ type LoopConfig struct {
 	MaxWallClock         time.Duration
 	MaxConsecutiveErrors int
 	LoopDetectionWindow  int
-	MaxToolResultBytes   int
-	ToolExecTimeout      time.Duration
-	StreamTimeout        time.Duration
+	// ForceTool, when set, is copied onto the operation intent so a run cannot
+	// complete without a successful invocation of that tool.
+	ForceTool          string
+	ForceToolAttempts  int
+	MaxToolResultBytes int
+	ToolExecTimeout    time.Duration
+	StreamTimeout      time.Duration
 }
 
 // DefaultLoopConfig returns sensible defaults.
@@ -74,6 +75,7 @@ func DefaultLoopConfig() LoopConfig {
 		MaxWallClock:         30 * time.Minute,
 		MaxConsecutiveErrors: 5,
 		LoopDetectionWindow:  3,
+		ForceToolAttempts:    2,
 		MaxToolResultBytes:   100_000,
 		ToolExecTimeout:      120 * time.Second,
 		StreamTimeout:        10 * time.Minute,
@@ -107,6 +109,10 @@ type LoopDeps struct {
 	Memory *memory.Store
 	// Episodic accumulates file changes and failures within a turn.
 	Episodic *EpisodicTracker
+	// Directors intercept inference and candidate completion. Nil uses DefaultDirectors.
+	Directors []Director
+	// Caps is the model/provider compatibility table. Nil uses capability.Default.
+	Caps *capability.Registry
 }
 
 // RunAgentLoop drives model ↔ tool rounds until the turn completes or a guardrail trips.
@@ -124,6 +130,9 @@ func RunAgentLoop(
 	}
 	if cfg.LoopDetectionWindow <= 0 {
 		cfg.LoopDetectionWindow = DefaultLoopConfig().LoopDetectionWindow
+	}
+	if cfg.ForceToolAttempts <= 0 {
+		cfg.ForceToolAttempts = DefaultLoopConfig().ForceToolAttempts
 	}
 	if cfg.MaxToolResultBytes <= 0 {
 		cfg.MaxToolResultBytes = DefaultLoopConfig().MaxToolResultBytes
@@ -158,208 +167,15 @@ func RunAgentLoop(
 				ID: stableID("r_start_", runID), Lane: "main",
 				Type: session.RecordOperationStarted, RunID: runID,
 				SourceLeafID: deps.Session.Leaf(),
-				Intent:       &session.OperationIntent{Kind: "run"},
+				Intent: &session.OperationIntent{
+					Kind: "run", ForceTool: cfg.ForceTool, ForceToolAttempts: cfg.ForceToolAttempts,
+				},
 			}); err != nil {
 				return err
 			}
 		}
 		return NewDriver(deps, cfg, emit).RunToCompletion(runCtx)
 	})
-}
-
-func runAgentLoopInner(
-	ctx context.Context,
-	deps LoopDeps,
-	cfg LoopConfig,
-	emit func(AgentEvent),
-	deadline time.Time,
-) error {
-	client := deps.Client
-	sess := deps.Session
-	todos := deps.Todos
-
-	llmTools := deps.Registry.AsLLMTools()
-	var recentHashes []string
-	toolCallsThisTurn := 0
-	consecutiveErrors := 0
-	overflowRetried := false
-
-	for invocation := 0; invocation < cfg.MaxModelInvocations; invocation++ {
-		if err := ctx.Err(); err != nil {
-			emit(AgentEvent{Type: EventTurnDone, Cancelled: true})
-			return err
-		}
-		if !deadline.IsZero() && time.Now().After(deadline) {
-			emit(AgentEvent{Type: EventError, Err: fmt.Errorf("wall-clock limit exceeded (%s)", cfg.MaxWallClock)})
-			emit(AgentEvent{Type: EventTurnDone})
-			return fmt.Errorf("wall-clock limit exceeded")
-		}
-
-		// Compact before building the request, not after a failure: the estimate
-		// is available now, whereas reported usage only arrives with a response.
-		if deps.Compactor != nil {
-			if _, cErr := deps.Compactor.MaybeCompact(ctx, sess, emit); cErr != nil {
-				// A failed compaction is not fatal — the request may still fit.
-				applog.Printf("loop: auto-compaction failed: %v", cErr)
-			}
-		}
-
-		messages, err := sess.BuildContext()
-		if err != nil {
-			emit(AgentEvent{Type: EventError, Err: err})
-			emit(AgentEvent{Type: EventTurnDone})
-			return err
-		}
-
-		opts := llm.ChatCompletionOptions{
-			Stream:     true,
-			Tools:      llmTools,
-			MaxRetries: 3,
-			Timeout:    cfg.StreamTimeout,
-		}
-		events := client.ChatCompletion(ctx, messages, opts)
-
-		var content strings.Builder
-		var toolCalls []*llm.ToolCall
-		var usageMeta map[string]string
-		var streamErr error
-		cancelled := false
-
-		for ev := range events {
-			switch ev.Type {
-			case llm.EventTypeContentDelta:
-				content.WriteString(ev.Content)
-				emit(AgentEvent{Type: EventContentDelta, Content: ev.Content})
-			case llm.EventTypeThinkingDelta:
-				emit(AgentEvent{Type: EventThinkingDelta, Content: ev.Content})
-			case llm.EventTypeToolCall:
-				if ev.Tool != nil {
-					toolCalls = append(toolCalls, ev.Tool)
-				}
-			case llm.EventTypeContentDone:
-				usageMeta = ev.Meta
-				cancelled = ev.Cancelled
-				emit(AgentEvent{Type: EventContentDone, Meta: ev.Meta, Cancelled: ev.Cancelled})
-			case llm.EventTypeError:
-				streamErr = ev.Error
-			}
-		}
-
-		// A context-overflow rejection is recoverable exactly once: compact and
-		// retry the same turn rather than losing the user's request.
-		if streamErr != nil {
-			if llm.IsContextOverflowError(streamErr) && !overflowRetried && deps.Compactor != nil {
-				overflowRetried = true
-				applog.Printf("loop: context overflow; compacting and retrying once")
-				if _, cErr := deps.Compactor.Compact(ctx, sess, emit); cErr == nil {
-					continue
-				}
-			}
-			emit(AgentEvent{Type: EventError, Err: streamErr})
-			emit(AgentEvent{Type: EventTurnDone})
-			return streamErr
-		}
-
-		if cancelled {
-			// Synthesize results for any collected tool calls so context stays balanced
-			if len(toolCalls) > 0 {
-				cleaned := sanitize.StripPseudoToolMarkup(content.String())
-				openaiCalls := toOpenAIToolCalls(toolCalls)
-				_, _ = sess.AppendAssistantMessage(cleaned, openaiCalls)
-				for _, tc := range toolCalls {
-					_, _ = sess.AppendToolResult(tc.ID, "Tool call cancelled.")
-				}
-			}
-			emit(AgentEvent{Type: EventTurnDone, Cancelled: true})
-			return context.Canceled
-		}
-
-		cleaned := sanitize.StripPseudoToolMarkup(content.String())
-		openaiCalls := toOpenAIToolCalls(toolCalls)
-		if _, err := sess.AppendAssistantMessage(cleaned, openaiCalls); err != nil {
-			emit(AgentEvent{Type: EventError, Err: err})
-			emit(AgentEvent{Type: EventTurnDone})
-			return err
-		}
-
-		if cm := sess.ContextManager(); cm != nil && usageMeta != nil {
-			u := contextmgr.TokenUsageFromMeta(usageMeta)
-			if u.TotalTokens > 0 || u.PromptTokens > 0 || u.CompletionTokens > 0 {
-				cm.SetLatestUsage(u)
-				cm.AddUsage(u)
-			}
-		}
-
-		if len(toolCalls) == 0 {
-			recordEpisode(ctx, deps)
-			emit(AgentEvent{Type: EventTurnDone})
-			return nil
-		}
-
-		for i, tc := range toolCalls {
-			if err := ctx.Err(); err != nil {
-				// Cancel remaining tool calls with synthetic results
-				for _, rem := range toolCalls[i:] {
-					_, _ = sess.AppendToolResult(rem.ID, "Tool call cancelled.")
-				}
-				emit(AgentEvent{Type: EventTurnDone, Cancelled: true})
-				return err
-			}
-
-			toolCallsThisTurn++
-			if toolCallsThisTurn > cfg.MaxToolCallsPerTurn {
-				msg := fmt.Sprintf("tool call limit exceeded (%d per turn)", cfg.MaxToolCallsPerTurn)
-				_, _ = sess.AppendToolResult(tc.ID, msg)
-				for _, rem := range toolCalls[i+1:] {
-					_, _ = sess.AppendToolResult(rem.ID, msg)
-				}
-				emit(AgentEvent{Type: EventError, Err: fmt.Errorf("%s", msg)})
-				emit(AgentEvent{Type: EventTurnDone})
-				return fmt.Errorf("%s", msg)
-			}
-
-			emit(AgentEvent{Type: EventToolCallStart, ToolCall: tc})
-
-			resultContent, result, todosChanged := dispatchToolCall(ctx, tc, deps, cfg, emit)
-			if _, err := sess.AppendToolResult(tc.ID, resultContent); err != nil {
-				emit(AgentEvent{Type: EventError, Err: err})
-				emit(AgentEvent{Type: EventTurnDone})
-				return err
-			}
-			deps.Episodic.Observe(tc, result.IsError, resultContent)
-			emit(AgentEvent{Type: EventToolCallResult, ToolCall: tc, ToolResult: &result})
-			if todosChanged && todos != nil {
-				emit(AgentEvent{Type: EventTodosChanged, Todos: todos.List()})
-			}
-
-			if result.IsError {
-				consecutiveErrors++
-				if cfg.MaxConsecutiveErrors > 0 && consecutiveErrors >= cfg.MaxConsecutiveErrors {
-					err := fmt.Errorf("too many consecutive tool errors (%d)", consecutiveErrors)
-					emit(AgentEvent{Type: EventError, Err: err})
-					emit(AgentEvent{Type: EventTurnDone})
-					return err
-				}
-			} else {
-				consecutiveErrors = 0
-			}
-
-			h := toolCallHash(tc)
-			recentHashes = append(recentHashes, h)
-			if len(recentHashes) > cfg.LoopDetectionWindow*2 {
-				recentHashes = recentHashes[len(recentHashes)-cfg.LoopDetectionWindow*2:]
-			}
-			if countRecent(recentHashes, h) >= cfg.LoopDetectionWindow {
-				notice := prompt.CreateLoopBreakerPrompt(fmt.Sprintf("repeated tool call %s", tc.Name))
-				_, _ = sess.AppendSystemNotice(notice)
-			}
-		}
-	}
-
-	err := fmt.Errorf("model invocation limit exceeded (%d)", cfg.MaxModelInvocations)
-	emit(AgentEvent{Type: EventError, Err: err})
-	emit(AgentEvent{Type: EventTurnDone})
-	return err
 }
 
 func dispatchToolCall(
@@ -369,6 +185,8 @@ func dispatchToolCall(
 	cfg LoopConfig,
 	emit func(AgentEvent),
 ) (content string, result tool.Result, todosChanged bool) {
+	startedAt := time.Now()
+	defer func() { result.Duration = time.Since(startedAt) }()
 	registry := deps.Registry
 	env := deps.Env
 	approvals := deps.Approvals
@@ -414,8 +232,8 @@ func dispatchToolCall(
 		msg := fmt.Sprintf("Tool execution failed: %v", err)
 		return msg, tool.Result{Content: msg, IsError: true, Display: "exec error"}, false
 	}
-	content = truncateResult(res.Content, cfg.MaxToolResultBytes)
-	res.Content = content
+	res.OutputBytes = len(res.Content)
+	content = res.Content
 	todosChanged = tc.Name == "todos"
 	if todosChanged && todos != nil {
 		_, _ = sess.AppendTodos(todos.List())
@@ -427,11 +245,34 @@ func truncateResult(s string, max int) string {
 	if max <= 0 || len(s) <= max {
 		return s
 	}
-	half := (max - 40) / 2
-	if half < 1 {
-		return s[:max]
+	const marker = "\n\n...[tool result truncated]...\n\n"
+	if max <= len(marker) {
+		return safePrefix(s, max)
 	}
-	return s[:half] + "\n\n...[tool result truncated]...\n\n" + s[len(s)-half:]
+	remaining := max - len(marker)
+	head := remaining / 2
+	return safePrefix(s, head) + marker + safeSuffix(s, remaining-head)
+}
+
+func safePrefix(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.ValidString(s[:n]) {
+		n--
+	}
+	return s[:n]
+}
+
+func safeSuffix(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.ValidString(s[start:]) {
+		start++
+	}
+	return s[start:]
 }
 
 func toOpenAIToolCalls(calls []*llm.ToolCall) []openai.ToolCall {

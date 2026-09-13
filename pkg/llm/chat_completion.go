@@ -127,7 +127,7 @@ func (c *Client) buildRequest(
 	// Add tools if provided
 	if len(opts.Tools) > 0 {
 		req.Tools = c.buildTools(opts.Tools)
-		req.ToolChoice = "auto"
+		req.ToolChoice = opts.ToolChoice.APIValue()
 	}
 
 	return req

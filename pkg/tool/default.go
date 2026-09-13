@@ -1,6 +1,9 @@
 package tool
 
-import "github.com/Vignesh-Rajarajan/golum/pkg/memory"
+import (
+	"github.com/Vignesh-Rajarajan/golum/pkg/mcp"
+	"github.com/Vignesh-Rajarajan/golum/pkg/memory"
+)
 
 // DefaultRegistry builds a registry with the standard tool set.
 // todosStore may be nil; a new store is created when nil.
@@ -17,6 +20,7 @@ func DefaultRegistry(todosStore *TodoStore) (*Registry, *TodoStore) {
 	r.Register(grepTool{})
 	r.Register(shellTool{})
 	r.Register(NewTodosTool(todosStore))
+	r.Register(NewInvokeTool(mcp.NewCatalog()))
 	return r, todosStore
 }
 

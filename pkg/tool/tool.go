@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/Vignesh-Rajarajan/golum/pkg/execenv"
 	"github.com/Vignesh-Rajarajan/golum/pkg/llm"
@@ -31,6 +32,13 @@ type Result struct {
 	Content string
 	IsError bool
 	Display string // optional one-line UI summary
+	// OutputBytes is the size before the harness applies its result limit.
+	OutputBytes int
+	Truncated   bool
+	// ArtifactPath is a workspace-relative file holding the full payload when
+	// Truncated is true. Empty when the result fit in the bound.
+	ArtifactPath string
+	Duration     time.Duration
 }
 
 // Registry holds registered tools.

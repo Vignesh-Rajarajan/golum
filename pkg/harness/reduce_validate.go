@@ -21,6 +21,11 @@ const (
 	CorruptionDuplicateToolInvocation  = "duplicate_tool_invocation"
 	CorruptionProvisionedEntryMismatch = "provisioned_entry_mismatch"
 	CorruptionInvalidDeferredHandle    = "invalid_deferred_handle"
+	CorruptionOrphanToolResult         = "orphan_tool_result"
+	CorruptionUnmatchedToolCalls       = "unmatched_tool_calls"
+	CorruptionNonMonotonicSeq          = "non_monotonic_seq"
+	CorruptionInvalidLane              = "invalid_lane"
+	CorruptionDuplicateFinished        = "duplicate_finished"
 )
 
 type CorruptionError struct {
@@ -55,7 +60,17 @@ func ValidateRecordLog(in RecordLogSlice) error {
 	invocations := map[string]session.Record{}
 	targets := map[string]session.ProvisionedEntry{}
 
+	var lastSeq int64 = -1
 	for _, r := range records {
+		if r.Lane != "" && r.Lane != "main" && r.Lane != "background" {
+			return corrupt(CorruptionInvalidLane, r, r.Lane)
+		}
+		if lastSeq >= 0 && r.Seq <= lastSeq {
+			return corrupt(CorruptionNonMonotonicSeq, r, fmt.Sprintf("seq %d after %d", r.Seq, lastSeq))
+		}
+		if r.Seq > 0 {
+			lastSeq = r.Seq
+		}
 		if r.Type == session.RecordOperationStarted {
 			started[r.RunID] = r
 			continue
@@ -70,6 +85,9 @@ func ValidateRecordLog(in RecordLogSlice) error {
 		}
 		switch r.Type {
 		case session.RecordOperationFinished:
+			if _, ok := finished[r.RunID]; ok {
+				return corrupt(CorruptionDuplicateFinished, r, r.RunID)
+			}
 			finished[r.RunID] = r
 		case session.RecordAbortRequested:
 			aborted[r.RunID] = true
@@ -140,6 +158,62 @@ func ValidateRecordLog(in RecordLogSlice) error {
 	for id, p := range targets {
 		if e, ok := entries[id]; ok && !p.Matches(e) {
 			return corrupt(CorruptionProvisionedEntryMismatch, session.Record{}, id)
+		}
+	}
+
+	called := map[string]bool{}
+	for _, e := range in.Entries {
+		if e.Kind != session.EntryAssistantMessage {
+			continue
+		}
+		for _, tc := range toolCalls(&e) {
+			called[tc.ID] = true
+		}
+	}
+	for _, e := range in.Entries {
+		if e.Kind != session.EntryToolResult {
+			continue
+		}
+		id := e.ToolCallID()
+		if id == "" || !called[id] {
+			return corrupt(CorruptionOrphanToolResult, session.Record{}, e.ID)
+		}
+	}
+	for runID, start := range started {
+		if _, ok := finished[runID]; !ok {
+			continue
+		}
+		if err := unmatchedToolCalls(runID, start.Seq, finished[runID].Seq, in.Entries, in.Records); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func unmatchedToolCalls(runID string, start, finish int64, entries []session.Entry, records []session.Record) error {
+	attempted := map[string]bool{}
+	for _, r := range records {
+		if r.RunID == runID && r.Type == session.RecordStepAttempt && r.Step == "assistant" {
+			attempted[r.ResultEntryID] = true
+		}
+	}
+	have := map[string]bool{}
+	for _, e := range entries {
+		if e.Kind == session.EntryToolResult {
+			have[e.ToolCallID()] = true
+		}
+	}
+	for _, e := range entries {
+		if e.Kind != session.EntryAssistantMessage || !attempted[e.ID] {
+			continue
+		}
+		if seq := int64(e.Seq); seq < start || (finish > 0 && seq > finish) {
+			continue
+		}
+		for _, tc := range toolCalls(&e) {
+			if !have[tc.ID] {
+				return corrupt(CorruptionUnmatchedToolCalls, session.Record{ID: e.ID, RunID: runID}, tc.ID)
+			}
 		}
 	}
 	return nil

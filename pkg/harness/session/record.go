@@ -44,6 +44,8 @@ type OperationIntent struct {
 	Summarize            bool               `json:"summarize,omitempty"`
 	Label                string             `json:"label,omitempty"`
 	SummaryEntryID       string             `json:"summary_entry_id,omitempty"`
+	ForceTool            string             `json:"force_tool,omitempty"`
+	ForceToolAttempts    int                `json:"force_tool_attempts,omitempty"`
 }
 
 type Record struct {

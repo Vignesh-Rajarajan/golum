@@ -61,9 +61,33 @@ type ChatCompletionOptions struct {
 	Model      string                 // Per-request model override
 	Stream     bool                   // Enable streaming response (default: true)
 	Tools      []Tool                 // Available tools/functions for the LLM
+	ToolChoice ToolChoice             // auto/none/required or a named function; zero = auto when tools are set
 	MaxRetries int                    // Maximum number of retries on rate limit/connection errors
 	Timeout    time.Duration          // Request timeout
 	Metadata   map[string]interface{} // Additional request metadata
+}
+
+// ToolChoice selects how the model may call tools. Mode is auto, none, or
+// required. Name, when set, forces a single function regardless of Mode.
+type ToolChoice struct {
+	Mode string
+	Name string
+}
+
+func (t ToolChoice) IsZero() bool { return t.Mode == "" && t.Name == "" }
+
+// APIValue is the OpenAI-compatible tool_choice payload.
+func (t ToolChoice) APIValue() any {
+	if t.Name != "" {
+		return map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": t.Name},
+		}
+	}
+	if t.Mode == "" {
+		return "auto"
+	}
+	return t.Mode
 }
 
 // Tool represents a tool/function that can be called by the LLM
