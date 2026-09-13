@@ -29,9 +29,11 @@ never override them.
 `pkg/evals/tasks/v2` and can be driven by `Environment.Script` against a local
 OpenAI-compatible server so PRs do not need a real model.
 
-CI gates: PR (`go test` + harness race + dataset validation), merge (full
-crash/SQLite/MCP suite), nightly (real-model repetitions), release (holdout +
-hash verification). `CompareToBaseline` classifies regressions by axis.
+CI gates live in GitHub Actions: **CI** (format, vet, `go test`, coverage,
+targeted race, CLI compile; a Linux amd64 snapshot on `main`), **Nightly**
+(real-model repetitions via `scripts/run-evals.sh` when an API secret is set),
+and **Release** (`v*` tags publish platform archives). `CompareToBaseline`
+classifies regressions by axis.
 
 ## Running evals
 

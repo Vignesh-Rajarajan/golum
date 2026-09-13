@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	maxGlobResults  = 1000
-	maxGrepMatches  = 200
+	maxGlobResults = 1000
+	maxGrepMatches = 200
 )
 
 type globTool struct{}
@@ -33,7 +33,7 @@ func (globTool) Parameters() map[string]any {
 }
 
 type globHit struct {
-	rel  string
+	rel   string
 	mtime time.Time
 }
 

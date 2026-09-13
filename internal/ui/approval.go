@@ -11,7 +11,7 @@ import (
 // Request emits nothing itself — the loop already emits EventToolCallAwaitingApproval;
 // Request blocks on a fresh channel until Decide is called from Update().
 type approvalBroker struct {
-	mu   sync.Mutex
+	mu      sync.Mutex
 	pending chan bool
 }
 

@@ -1,5 +1,9 @@
 # Golum
 
+[![CI](https://github.com/Vignesh-Rajarajan/golum/actions/workflows/ci.yml/badge.svg)](https://github.com/Vignesh-Rajarajan/golum/actions/workflows/ci.yml)
+[![Nightly](https://github.com/Vignesh-Rajarajan/golum/actions/workflows/nightly.yml/badge.svg)](https://github.com/Vignesh-Rajarajan/golum/actions/workflows/nightly.yml)
+[![Release](https://github.com/Vignesh-Rajarajan/golum/actions/workflows/release.yml/badge.svg)](https://github.com/Vignesh-Rajarajan/golum/actions/workflows/release.yml)
+
 A terminal coding agent, built in Go, in the spirit of Claude Code. Golum runs a
 tool-using LLM in a loop against your codebase — reading and editing files,
 running shell commands, searching, and remembering things across sessions —
@@ -48,6 +52,37 @@ a crash or a restart.
 └── examples/                # Standalone usage examples
 ```
 
+## Install
+
+### From a GitHub Release
+
+Download the archive for your OS and architecture from
+[Releases](https://github.com/Vignesh-Rajarajan/golum/releases). Archives are
+named `golum_<version>_<os>_<arch>` (`.tar.gz` on Unix, `.zip` on Windows).
+
+Verify the checksums published with the release:
+
+```bash
+shasum -a 256 -c checksums.txt
+# or: sha256sum -c checksums.txt
+```
+
+Unpack and put `golum` on your `PATH`.
+
+A short-lived Linux amd64 snapshot is also attached to each successful
+[CI run on `main`](https://github.com/Vignesh-Rajarajan/golum/actions/workflows/ci.yml)
+as the `golum-linux-amd64-snapshot` artifact.
+
+### From source
+
+```bash
+go install github.com/Vignesh-Rajarajan/golum/cmd/golum@latest
+# or:
+git clone https://github.com/Vignesh-Rajarajan/golum.git
+cd golum
+make build   # writes ./dist/golum
+```
+
 ## Setup
 
 1. Copy `.env.example` to `.env`:
@@ -64,10 +99,10 @@ a crash or a restart.
    OPENROUTER_API_KEY=your_openrouter_api_key_here
    ```
 
-3. Install dependencies and run:
+3. Run:
    ```bash
-   go mod download
    go run ./cmd/golum
+   # or: ./dist/golum
    ```
 
 ### CLI flags
@@ -108,10 +143,36 @@ instructions go in `AGENTS.md`; user-level instructions in `~/.golum/AGENTS.md`.
 - [github.com/pkoukk/tiktoken-go](https://github.com/pkoukk/tiktoken-go) — token counting
 - [github.com/google/uuid](https://github.com/google/uuid), [github.com/joho/godotenv](https://github.com/joho/godotenv)
 
+## Development
+
+Deterministic checks run in [CI](https://github.com/Vignesh-Rajarajan/golum/actions/workflows/ci.yml).
+There are no required local Git hooks.
+
+```bash
+make fmt-check
+make vet
+make test
+make test-race
+make cover          # writes coverage.out (also uploaded from CI)
+make build          # ./dist/golum
+```
+
+Model-backed evaluations are optional. Nightly reports land on the
+[Nightly workflow](https://github.com/Vignesh-Rajarajan/golum/actions/workflows/nightly.yml)
+run summary and as the `nightly-eval-report` artifact (kept 30 days). Locally:
+
+```bash
+scripts/run-evals.sh --model gpt-4o
+```
+
+See [pkg/evals/README.md](./pkg/evals/README.md).
+
 ## Documentation
 - [Behavioral evals](./pkg/evals/README.md) — model-backed harness checks (`scripts/run-evals.sh`)
+- [Contributing](./CONTRIBUTING.md)
+- [Security](./SECURITY.md)
 - [Examples](./examples/)
 
 ## License
 
-MIT
+[MIT](./LICENSE)

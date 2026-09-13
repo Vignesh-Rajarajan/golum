@@ -119,4 +119,3 @@ func blendColors(size int, stops ...color.Color) []color.Color {
 
 	return blended
 }
-

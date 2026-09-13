@@ -90,17 +90,17 @@ func (r *TestRig) rebuildDriver() {
 		approvals = AutoApprove{}
 	}
 	r.Deps = LoopDeps{
-		Client:     r.Model.Client(),
-		Session:    r.Session,
-		Registry:   r.Registry,
-		Env:        r.Env,
-		Approvals:  approvals,
-		Todos:      r.Todos,
-		Compactor:  r.Deps.Compactor,
-		Caps:       r.Deps.Caps,
-		Directors:  r.Deps.Directors,
+		Client:      r.Model.Client(),
+		Session:     r.Session,
+		Registry:    r.Registry,
+		Env:         r.Env,
+		Approvals:   approvals,
+		Todos:       r.Todos,
+		Compactor:   r.Deps.Compactor,
+		Caps:        r.Deps.Caps,
+		Directors:   r.Deps.Directors,
 		ActiveTools: r.Deps.ActiveTools,
-		Model:      "gpt-4o",
+		Model:       "gpt-4o",
 	}
 	r.Driver = NewDriver(r.Deps, r.Cfg, func(ev AgentEvent) {
 		r.Events = append(r.Events, ev)

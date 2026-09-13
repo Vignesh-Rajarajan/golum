@@ -1,4 +1,4 @@
-.PHONY: test test-race test-pr test-merge bench evals
+.PHONY: test test-race vet fmt-check cover build bench evals ci
 
 test:
 	go test ./...
@@ -6,17 +6,28 @@ test:
 test-race:
 	go test -race ./pkg/harness ./pkg/harness/session ./pkg/evals
 
-test-pr: test
-	go test ./pkg/harness ./pkg/harness/session ./pkg/evals ./pkg/evals/tasks/v1 ./pkg/evals/tasks/v2 ./pkg/tool ./pkg/execenv ./pkg/llm/...
-	go test -race ./pkg/harness ./pkg/harness/session
+vet:
+	go vet ./...
 
-test-merge: test-pr
-	go test ./pkg/harness -count=1
-	go test ./pkg/harness/session -count=1
-	go test ./pkg/evals -count=1
+fmt-check:
+	@unformatted="$$(gofmt -l .)"; \
+	if [ -n "$$unformatted" ]; then \
+		echo "gofmt needed on:" >&2; \
+		echo "$$unformatted" >&2; \
+		exit 1; \
+	fi
+
+cover:
+	go test ./... -count=1 -coverprofile=coverage.out
+
+build:
+	mkdir -p dist
+	CGO_ENABLED=0 go build -trimpath -o dist/golum ./cmd/golum
 
 bench:
 	go test -bench=. -benchmem ./pkg/harness ./pkg/harness/session ./pkg/evals
 
 evals:
-	go test -tags evals ./pkg/evals/suite
+	scripts/run-evals.sh
+
+ci: fmt-check vet test test-race build
