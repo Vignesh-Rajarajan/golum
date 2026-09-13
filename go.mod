@@ -13,7 +13,7 @@ require (
 	github.com/mattn/go-runewidth v0.0.20
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/rivo/uniseg v0.4.7
-	github.com/sashabaranov/go-openai v1.36.0
+	github.com/sashabaranov/go-openai v1.42.0
 	modernc.org/sqlite v1.55.0
 )
 
