@@ -23,10 +23,10 @@ const (
 )
 
 type Message struct {
-	Role    MessageRole
-	Content string
-	Meta    map[string]string
-	IsError bool
+	Role      MessageRole
+	Content   string
+	Meta      map[string]string
+	IsError   bool
 	Collapsed bool // for thinking blocks
 }
 

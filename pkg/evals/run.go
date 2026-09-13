@@ -39,12 +39,12 @@ type TaskRun struct {
 	Performance []Check
 	Subjective  []Check
 
-	OutcomePassed      bool
-	ProcessPassed      bool
-	SafetyPassed       bool
-	ReliabilityPassed  bool
-	PerformancePassed  bool
-	ResponsePassed     bool
+	OutcomePassed     bool
+	ProcessPassed     bool
+	SafetyPassed      bool
+	ReliabilityPassed bool
+	PerformancePassed bool
+	ResponsePassed    bool
 
 	Metrics     Metrics
 	Attribution *Attribution

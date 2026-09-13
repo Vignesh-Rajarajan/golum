@@ -1,29 +1,90 @@
-name: release
+name: Release
 
 on:
-  workflow_dispatch:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
   release:
+    name: Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: go.mod
-      - name: Full test and race
+
+      - name: Check formatting
         run: |
-          go test ./...
-          go test -race ./pkg/harness ./pkg/harness/session ./pkg/evals
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./... -count=1
+
+      - name: Race tests
+        run: go test -race -count=1 ./pkg/harness ./pkg/harness/session ./pkg/evals
+
       - name: Dataset hashes
         run: go test ./pkg/evals/tasks/v1 -run TestV1HashesAreFrozen -count=1
-      - name: Holdout evals
-        if: env.OPENAI_API_KEY != '' || env.OPENROUTER_API_KEY != ''
+
+      - name: Compile and smoke-test native CLI
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -o dist/golum ./cmd/golum
+          ./dist/golum -h
+
+      - name: Package release archives
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          GOLUM_EVAL_SPLIT: holdout
-        run: go test -tags evals ./pkg/evals/suite -count=1
-        continue-on-error: true
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          targets="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
+          for target in $targets; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            ext=""
+            [ "$os" = "windows" ] && ext=".exe"
+            bin="dist/golum${ext}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -o "$bin" ./cmd/golum
+            if [ "$os" = "windows" ]; then
+              archive="dist/golum_${VERSION}_${os}_${arch}.zip"
+              (cd dist && zip -q "$(basename "$archive")" "golum${ext}")
+            else
+              archive="dist/golum_${VERSION}_${os}_${arch}.tar.gz"
+              tar -C dist -czf "$archive" "golum${ext}"
+            fi
+            rm -f "$bin"
+          done
+          (cd dist && sha256sum golum_${VERSION}_*.tar.gz golum_${VERSION}_*.zip > checksums.txt)
+          ls -l dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=(dist/golum_"${VERSION}"_*.tar.gz dist/golum_"${VERSION}"_*.zip dist/checksums.txt)
+          gh release create "$VERSION" "${assets[@]}" \
+            --title "$VERSION" \
+            --generate-notes

@@ -12,12 +12,12 @@ import (
 type VerifierKind string
 
 const (
-	KindOutcome      VerifierKind = "outcome"
-	KindProcess      VerifierKind = "process"
-	KindSafety       VerifierKind = "safety"
-	KindReliability  VerifierKind = "reliability"
-	KindPerformance  VerifierKind = "performance"
-	KindSubjective   VerifierKind = "subjective"
+	KindOutcome     VerifierKind = "outcome"
+	KindProcess     VerifierKind = "process"
+	KindSafety      VerifierKind = "safety"
+	KindReliability VerifierKind = "reliability"
+	KindPerformance VerifierKind = "performance"
+	KindSubjective  VerifierKind = "subjective"
 )
 
 // Check is one verifier's judgment.

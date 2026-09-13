@@ -1,24 +1,75 @@
-name: nightly
+name: Nightly
 
 on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   evals:
-    if: github.repository == 'Vignesh-Rajarajan/golum'
+    name: Model evals
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        if: ${{ secrets.OPENAI_API_KEY != '' || secrets.OPENROUTER_API_KEY != '' }}
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: go.mod
-      - name: Real-model evals
+
+      - name: Skip when no API secret is configured
+        if: ${{ secrets.OPENAI_API_KEY == '' && secrets.OPENROUTER_API_KEY == '' }}
+        run: |
+          {
+            echo "## Nightly evals skipped"
+            echo
+            echo "No \`OPENAI_API_KEY\` or \`OPENROUTER_API_KEY\` repository secret is configured."
+            echo "Model-backed evaluations were not started."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run evaluations
+        id: evals
+        if: ${{ secrets.OPENAI_API_KEY != '' || secrets.OPENROUTER_API_KEY != '' }}
+        continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GOLUM_EVAL_MODEL: ${{ vars.GOLUM_EVAL_MODEL || 'gpt-4o' }}
           GOLUM_EVAL_REPETITIONS: "3"
           GOLUM_EVAL_SPLIT: dev
-        run: go test -tags evals ./pkg/evals/suite -count=1
-        continue-on-error: true
+          GOLUM_EVAL_ARTIFACT_DIR: ${{ github.workspace }}/eval-artifacts
+        run: |
+          mkdir -p "$GOLUM_EVAL_ARTIFACT_DIR"
+          scripts/run-evals.sh
+
+      - name: Append report to run summary
+        if: ${{ always() && (secrets.OPENAI_API_KEY != '' || secrets.OPENROUTER_API_KEY != '') }}
+        run: |
+          report="${{ github.workspace }}/eval-artifacts/report.md"
+          if [ -f "$report" ]; then
+            echo "## Nightly eval report" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Nightly eval report" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "No \`report.md\` was written. The evaluation script may have exited before FlushReport." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload eval artifacts
+        if: ${{ always() && (secrets.OPENAI_API_KEY != '' || secrets.OPENROUTER_API_KEY != '') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-eval-report
+          path: eval-artifacts
+          retention-days: 30
+          if-no-files-found: ignore

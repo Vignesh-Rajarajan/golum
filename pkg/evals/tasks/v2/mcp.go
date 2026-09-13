@@ -29,7 +29,7 @@ func mcpTasks() []evals.Task {
 				{Content: "ECHO_OK"},
 			},
 		},
-			Acceptance: evals.AcceptanceCriteria{
+		Acceptance: evals.AcceptanceCriteria{
 			Outcome: []evals.OutcomeVerifier{evals.FinalAnswerEquals("ECHO_OK")},
 			Process: []evals.ProcessVerifier{
 				evals.ToolUsed("invoke"),
